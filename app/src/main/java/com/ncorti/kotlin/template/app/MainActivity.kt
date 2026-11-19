@@ -86,6 +86,16 @@ import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 
 data class ApiResponse(val data: List<PokemonCardDto>)
+data class SetsApiResponse(val data: List<RemoteSetDto>)
+data class RemoteSetDto(
+    val id: String,
+    val name: String,
+    val series: String? = null,
+    val ptcgoCode: String? = null,
+    val total: Int? = null,
+    val releaseDate: String? = null
+)
+
 data class PokemonCardDto(val id: String, val name: String, val number: String, val set: CardSetDto, val images: CardImagesDto)
 data class CardSetDto(val id: String? = null, val name: String)
 data class CardImagesDto(val small: String, val large: String)
@@ -113,37 +123,6 @@ data class HashedCard(
     fun toDto() = PokemonCardDto(id, name, number, CardSetDto(setId, setName), CardImagesDto(imageUrl, imageUrl))
 }
 
-data class SetPreset(val code: String, val apiId: String, val title: String)
-
-val AVAILABLE_SETS = listOf(
-    SetPreset("WHT", "rsv10pt5", "White Flare (WHT)"),
-    SetPreset("BLK", "zsv10pt5", "Black Bolt (BLK)"),
-    SetPreset("DRI", "sv10", "Destined Rivals (DRI)"),
-    SetPreset("JTG", "sv9", "Journey Together (JTG)"),
-    SetPreset("PRE", "sv8pt5", "Prismatic Evolutions (PRE)"),
-    SetPreset("SSP", "sv8", "Surging Sparks (SSP)"),
-    SetPreset("SCR", "sv7", "Stellar Crown (SCR)"),
-    SetPreset("SFA", "sv6pt5", "Shrouded Fable (SFA)"),
-    SetPreset("TWM", "sv6", "Twilight Masquerade (TWM)"),
-    SetPreset("TEF", "sv5", "Temporal Forces (TEF)"),
-    SetPreset("PAF", "sv4pt5", "Paldean Fates (PAF)"),
-    SetPreset("PAR", "sv4", "Paradox Rift (PAR)"),
-    SetPreset("MEW", "sv3pt5", "151 (MEW)"),
-    SetPreset("OBF", "sv3", "Obsidian Flames (OBF)"),
-    SetPreset("PAL", "sv2", "Paldea Evolved (PAL)"),
-    SetPreset("SVI", "sv1", "Scarlet & Violet (SVI)"),
-    SetPreset("SVP", "svp", "SV Black Star Promos (SVP)"),
-    SetPreset("CRZ", "swsh12pt5", "Crown Zenith (CRZ)"),
-    SetPreset("SIT", "swsh12", "Silver Tempest (SIT)"),
-    SetPreset("LOR", "swsh11", "Lost Origin (LOR)"),
-    SetPreset("PGO", "pgo", "Pokémon GO (PGO)"),
-    SetPreset("ASR", "swsh10", "Astral Radiance (ASR)"),
-    SetPreset("BRS", "swsh9", "Brilliant Stars (BRS)"),
-    SetPreset("FST", "swsh8", "Fusion Strike (FST)"),
-    SetPreset("CEL", "cel25", "Celebrations (CEL)"),
-    SetPreset("EVS", "swsh7", "Evolving Skies (EVS)")
-)
-
 interface PokemonTcgApi {
     @GET("v2/cards")
     suspend fun getCardsBySet(
@@ -152,6 +131,14 @@ interface PokemonTcgApi {
         @Query("page") page: Int = 1,
         @Query("select") s: String = "id,name,number,set,images"
     ): ApiResponse
+
+    @GET("v2/sets")
+    suspend fun getAllSets(
+        @Query("pageSize") ps: Int = 250,
+        @Query("page") page: Int = 1,
+        @Query("orderBy") orderBy: String = "-releaseDate",
+        @Query("select") s: String = "id,name,series,ptcgoCode,total,releaseDate"
+    ): SetsApiResponse
 }
 
 object ApiClient {
@@ -173,7 +160,6 @@ object ApiClient {
 // --- Visual Hashing Engine (dHash 64-bit + RGB Color Grid) ---
 object VisualMatcher {
     fun computeSignature(bmp: Bitmap): Pair<Long, IntArray> {
-        // Вычисляем dHash на сетке 9x8 (64 бита)
         val gray = Bitmap.createScaledBitmap(bmp, 9, 8, true)
         var hash = 0L
         var bit = 0
@@ -191,7 +177,6 @@ object VisualMatcher {
         }
         gray.recycle()
 
-        // Цветовая сигнатура 4x4 (16 зон * 3 канала = 48 значений)
         val small = Bitmap.createScaledBitmap(bmp, 4, 4, true)
         val sig = IntArray(48)
         var idx = 0
@@ -223,7 +208,7 @@ object VisualMatcher {
 
         for (c in pool) {
             val hamming = java.lang.Long.bitCount(frameHash xor c.dHash)
-            if (hamming > 22) continue // Быстрый отсев непохожих карт
+            if (hamming > 22) continue
 
             var colorDiff = 0
             val cSig = c.colorSig
@@ -232,7 +217,6 @@ object VisualMatcher {
                     colorDiff += abs(frameColor[i] - cSig[i])
                 }
             }
-            // Комбинированный скор: структура + цвет
             val score = hamming * 35 + (colorDiff / 48)
             if (score < bestScore) {
                 bestScore = score
@@ -240,7 +224,6 @@ object VisualMatcher {
             }
         }
 
-        // Порог уверенного совпадения (чем меньше score, тем точнее)
         return if (bestCard != null && bestScore <= 620) bestCard to bestScore else null
     }
 }
@@ -249,6 +232,7 @@ class CollectionRepository(ctx: Context) {
     private val cf = File(ctx.filesDir, "pokemon_collection.json")
     private val ff = File(ctx.filesDir, "custom_folders.json")
     private val hf = File(ctx.filesDir, "visual_hashes_v1.json")
+    private val sf = File(ctx.filesDir, "all_sets_cache.json")
     private val gson = Gson()
 
     fun loadCards(): List<CollectedCard> = try {
@@ -271,6 +255,13 @@ class CollectionRepository(ctx: Context) {
     } catch (_: Exception) { emptyList() }
 
     fun saveHashes(h: List<HashedCard>) = hf.writeText(gson.toJson(h))
+
+    fun loadSetsCache(): List<RemoteSetDto> = try {
+        if (!sf.exists()) emptyList()
+        else gson.fromJson(sf.readText(), object : TypeToken<List<RemoteSetDto>>() {}.type) ?: emptyList()
+    } catch (_: Exception) { emptyList() }
+
+    fun saveSetsCache(s: List<RemoteSetDto>) = sf.writeText(gson.toJson(s))
 }
 
 class MainActivity : ComponentActivity() {
@@ -288,8 +279,29 @@ fun PokeCollectorApp() {
     var cards by remember { mutableStateOf(repo.loadCards()) }
     var folders by remember { mutableStateOf(repo.loadFolders()) }
     var visualDb by remember { mutableStateOf(repo.loadHashes()) }
+    var allSets by remember { mutableStateOf(repo.loadSetsCache()) }
     var scanFolder by remember { mutableStateOf<String?>(null) }
     var tab by remember { mutableIntStateOf(0) }
+
+    LaunchedEffect(Unit) {
+        try {
+            val fetched = withContext(Dispatchers.IO) {
+                val res = mutableListOf<RemoteSetDto>()
+                var p = 1
+                while (true) {
+                    val r = ApiClient.api.getAllSets(250, p)
+                    res.addAll(r.data)
+                    if (r.data.size < 250) break
+                    p++
+                }
+                res
+            }
+            if (fetched.isNotEmpty()) {
+                allSets = fetched
+                repo.saveSetsCache(fetched)
+            }
+        } catch (_: Exception) {}
+    }
 
     fun upd(l: List<CollectedCard>) { cards = l; repo.saveCards(l) }
     fun addF(n: String) { val c = n.trim(); if (c.isNotEmpty() && !folders.contains(c)) { folders = folders + c; repo.saveFolders(folders) } }
@@ -323,6 +335,8 @@ fun PokeCollectorApp() {
                 folders = folders,
                 activeFolder = scanFolder,
                 visualDb = visualDb,
+                allSets = allSets,
+                onSetsLoaded = { s -> allSets = s; repo.saveSetsCache(s) },
                 onUpdateDb = { newDb -> visualDb = newDb; repo.saveHashes(newDb) },
                 onSelFolder = { scanFolder = it },
                 onNewFolder = ::addF,
@@ -361,7 +375,6 @@ fun extractCardCropBitmap(image: Image, rotationDegrees: Int): Bitmap? {
             }
         } else bmp
 
-        // Вырезаем центральную область под рамку карты (пропорция 2.5 : 3.5 = 0.714)
         val w = rotated.width
         val h = rotated.height
         val targetRatio = 2.5f / 3.5f
@@ -383,15 +396,16 @@ fun extractCardCropBitmap(image: Image, rotationDegrees: Int): Bitmap? {
 }
 
 suspend fun downloadAndHashSet(
-    setPreset: SetPreset,
+    targetSet: RemoteSetDto,
     existingDb: List<HashedCard>,
     onProgress: (String) -> Unit
 ): List<HashedCard> = withContext(Dispatchers.IO) {
-    onProgress("Загружаю список карт ${setPreset.code}...")
+    val label = targetSet.ptcgoCode ?: targetSet.id.uppercase()
+    onProgress("Загружаю список карт $label...")
     val allDtos = mutableListOf<PokemonCardDto>()
     var page = 1
     while (true) {
-        val resp = ApiClient.api.getCardsBySet("set.id:${setPreset.apiId}", 250, page)
+        val resp = ApiClient.api.getCardsBySet("set.id:${targetSet.id}", 250, page)
         allDtos.addAll(resp.data)
         if (resp.data.size < 250) break
         page++
@@ -418,13 +432,13 @@ suspend fun downloadAndHashSet(
                                     bmp.recycle()
                                     done++
                                     if (done % 15 == 0 || done == toDownload.size) {
-                                        onProgress("${setPreset.code}: $done / ${toDownload.size}")
+                                        onProgress("$label: $done / ${toDownload.size}")
                                     }
                                     return@withPermit HashedCard(
                                         id = dto.id,
                                         name = dto.name,
                                         number = dto.number,
-                                        setId = setPreset.apiId,
+                                        setId = targetSet.id,
                                         setName = dto.set.name,
                                         imageUrl = dto.images.small,
                                         dHash = dHash,
@@ -440,7 +454,7 @@ suspend fun downloadAndHashSet(
         }.awaitAll().filterNotNull()
     }
 
-    existingDb.filter { it.setId != setPreset.apiId } + existingDb.filter { it.setId == setPreset.apiId } + newHashed
+    existingDb + newHashed
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -449,6 +463,8 @@ fun ScannerScreen(
     folders: List<String>,
     activeFolder: String?,
     visualDb: List<HashedCard>,
+    allSets: List<RemoteSetDto>,
+    onSetsLoaded: (List<RemoteSetDto>) -> Unit,
     onUpdateDb: (List<HashedCard>) -> Unit,
     onSelFolder: (String?) -> Unit,
     onNewFolder: (String) -> Unit,
@@ -503,7 +519,9 @@ fun ScannerScreen(
     if (dbDlg) {
         VisualDbDialog(
             visualDb = visualDb,
+            allSets = allSets,
             activeSetFilter = selectedSetFilter,
+            onSetsLoaded = onSetsLoaded,
             onSelectSetFilter = { selectedSetFilter = it },
             onUpdateDb = { updated ->
                 onUpdateDb(updated)
@@ -546,7 +564,6 @@ fun ScannerScreen(
                                     if (match == null) {
                                         candidateId = ""
                                         candidateStreak = 0
-                                        // Если карту убрали из рамки — снимаем блокировку дубля
                                         if (lastAddedCardId.isNotEmpty() && java.lang.Long.bitCount(frameHash xor lastMatchedHash) > 18) {
                                             lastAddedCardId = ""
                                             status = "Жду следующую карту..."
@@ -564,7 +581,6 @@ fun ScannerScreen(
                                             candidateStreak = 1
                                         }
 
-                                        // 2 кадра подряд для защиты от случайного смаза при движении руки
                                         if (isManual || (curAuto && candidateStreak >= 2 && card.id != lastAddedCardId)) {
                                             lastAddedCardId = card.id
                                             lastMatchedHash = frameHash
@@ -592,7 +608,6 @@ fun ScannerScreen(
             }
         }, modifier = Modifier.fillMaxSize())
 
-        // Визуальная рамка для позиционирования карты (пропорция 2.5 x 3.5)
         Canvas(modifier = Modifier.fillMaxSize()) {
             val targetRatio = 2.5f / 3.5f
             var boxW = size.width * 0.64f
@@ -700,27 +715,73 @@ fun ScannerScreen(
 @Composable
 fun VisualDbDialog(
     visualDb: List<HashedCard>,
+    allSets: List<RemoteSetDto>,
     activeSetFilter: String?,
+    onSetsLoaded: (List<RemoteSetDto>) -> Unit,
     onSelectSetFilter: (String?) -> Unit,
     onUpdateDb: (List<HashedCard>) -> Unit,
     onDismiss: () -> Unit
 ) {
     val scope = rememberCoroutineScope()
-    var downloadingCode by remember { mutableStateOf<String?>(null) }
+    var downloadingId by remember { mutableStateOf<String?>(null) }
+    var loadingSetsList by remember { mutableStateOf(false) }
     var progressText by remember { mutableStateOf("") }
+    var searchSet by remember { mutableStateOf("") }
+
+    LaunchedEffect(Unit) {
+        if (allSets.isEmpty()) {
+            loadingSetsList = true
+            try {
+                val fetched = withContext(Dispatchers.IO) {
+                    val res = mutableListOf<RemoteSetDto>()
+                    var p = 1
+                    while (true) {
+                        val r = ApiClient.api.getAllSets(250, p)
+                        res.addAll(r.data)
+                        if (r.data.size < 250) break
+                        p++
+                    }
+                    res
+                }
+                if (fetched.isNotEmpty()) onSetsLoaded(fetched)
+            } catch (e: Exception) {
+                progressText = "Ошибка загрузки сетов: ${e.message?.take(30) ?: "сеть"}"
+            } finally {
+                loadingSetsList = false
+            }
+        }
+    }
+
+    val filteredSets = remember(allSets, searchSet) {
+        if (searchSet.isBlank()) allSets
+        else allSets.filter {
+            it.name.contains(searchSet, ignoreCase = true) ||
+                (it.ptcgoCode ?: "").contains(searchSet, ignoreCase = true) ||
+                it.id.contains(searchSet, ignoreCase = true) ||
+                (it.series ?: "").contains(searchSet, ignoreCase = true)
+        }
+    }
 
     AlertDialog(
-        onDismissRequest = { if (downloadingCode == null) onDismiss() },
+        onDismissRequest = { if (downloadingId == null) onDismiss() },
         title = {
             Column {
-                Text("Оффлайн-база карт (${visualDb.size})")
+                Text("Все сеты (${allSets.size}) • В базе: ${visualDb.size}")
                 if (progressText.isNotEmpty()) {
                     Text(progressText, fontSize = 12.sp, color = Color(0xFF81D4FA))
                 }
             }
         },
         text = {
-            Column(Modifier.heightIn(max = 380.dp)) {
+            Column(Modifier.heightIn(max = 420.dp)) {
+                OutlinedTextField(
+                    value = searchSet,
+                    onValueChange = { searchSet = it },
+                    placeholder = { Text("Поиск сета (WHT, 151, Base, Scarlet...)", fontSize = 12.sp) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(6.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     FilterChip(
                         selected = activeSetFilter == null,
@@ -729,50 +790,58 @@ fun VisualDbDialog(
                     )
                 }
                 Spacer(Modifier.height(6.dp))
-                LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    items(AVAILABLE_SETS) { preset ->
-                        val countInDb = visualDb.count { it.setId == preset.apiId }
-                        val isCurrentFilter = activeSetFilter == preset.apiId
-                        Row(
-                            Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(8.dp))
-                                .background(if (isCurrentFilter) Color(0xFF1E3A5F) else Color.White.copy(0.05f))
-                                .clickable { if (countInDb > 0) onSelectSetFilter(if (isCurrentFilter) null else preset.apiId) }
-                                .padding(horizontal = 10.dp, vertical = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column(Modifier.weight(1f)) {
-                                Text(preset.title, fontSize = 13.sp, fontWeight = FontWeight.Medium)
-                                Text(
-                                    if (countInDb > 0) "Скачано: $countInDb карт" + (if (isCurrentFilter) " • Активный фильтр" else "") else "Не загружен",
-                                    fontSize = 11.sp,
-                                    color = if (countInDb > 0) Color(0xFF81C784) else Color.Gray
-                                )
-                            }
-                            if (downloadingCode == preset.code) {
-                                CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
-                            } else {
-                                TextButton(
-                                    onClick = {
-                                        downloadingCode = preset.code
-                                        progressText = "Подключение к pokemontcg.io..."
-                                        scope.launch {
-                                            try {
-                                                val updated = downloadAndHashSet(preset, visualDb) { progressText = it }
-                                                onUpdateDb(updated)
-                                                onSelectSetFilter(preset.apiId)
-                                                progressText = "Готово: ${preset.title}"
-                                            } catch (e: Exception) {
-                                                progressText = "Ошибка сети: ${e.message?.take(30) ?: "сбой"}"
-                                            } finally {
-                                                downloadingCode = null
+                if (loadingSetsList && allSets.isEmpty()) {
+                    Box(Modifier.fillMaxWidth().height(160.dp), contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator()
+                    }
+                } else {
+                    LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        items(filteredSets, key = { it.id }) { s ->
+                            val countInDb = visualDb.count { it.setId == s.id }
+                            val isCurrentFilter = activeSetFilter == s.id
+                            val codeBadge = s.ptcgoCode ?: s.id.uppercase()
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(if (isCurrentFilter) Color(0xFF1E3A5F) else Color.White.copy(0.05f))
+                                    .clickable { if (countInDb > 0) onSelectSetFilter(if (isCurrentFilter) null else s.id) }
+                                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    Text("${s.name} ($codeBadge)", fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                                    Text(
+                                        if (countInDb > 0) "Скачано: $countInDb карт" + (if (isCurrentFilter) " • Фильтр" else "")
+                                        else "${s.series ?: ""} • ${s.total ?: "?"} карт",
+                                        fontSize = 11.sp,
+                                        color = if (countInDb > 0) Color(0xFF81C784) else Color.Gray
+                                    )
+                                }
+                                if (downloadingId == s.id) {
+                                    CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
+                                } else {
+                                    TextButton(
+                                        onClick = {
+                                            downloadingId = s.id
+                                            progressText = "Подключение к pokemontcg.io..."
+                                            scope.launch {
+                                                try {
+                                                    val updated = downloadAndHashSet(s, visualDb) { progressText = it }
+                                                    onUpdateDb(updated)
+                                                    onSelectSetFilter(s.id)
+                                                    progressText = "Готово: ${s.name}"
+                                                } catch (e: Exception) {
+                                                    progressText = "Ошибка сети: ${e.message?.take(30) ?: "сбой"}"
+                                                } finally {
+                                                    downloadingId = null
+                                                }
                                             }
-                                        }
-                                    },
-                                    enabled = downloadingCode == null
-                                ) {
-                                    Text(if (countInDb > 0) "Обновить" else "Скачать", fontSize = 12.sp)
+                                        },
+                                        enabled = downloadingId == null
+                                    ) {
+                                        Text(if (countInDb > 0) "Обновить" else "Скачать", fontSize = 12.sp)
+                                    }
                                 }
                             }
                         }
@@ -781,7 +850,7 @@ fun VisualDbDialog(
             }
         },
         confirmButton = {
-            TextButton(onClick = onDismiss, enabled = downloadingCode == null) {
+            TextButton(onClick = onDismiss, enabled = downloadingId == null) {
                 Text("Закрыть")
             }
         }
