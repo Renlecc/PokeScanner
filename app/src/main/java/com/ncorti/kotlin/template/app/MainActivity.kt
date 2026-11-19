@@ -4,6 +4,9 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Rect
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.os.Build
 import android.os.Bundle
 import android.os.VibrationEffect
@@ -18,6 +21,7 @@ import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyRow
@@ -142,19 +146,33 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
     val launch = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { perm = it }
     LaunchedEffect(Unit) { if (!perm) launch.launch(Manifest.permission.CAMERA) }
 
-    var status by remember { mutableStateOf("Жду карту...") }
+    var status by remember { mutableStateOf("Положите карту в рамку...") }
     var found by remember { mutableStateOf<PokemonCardDto?>(null) }
     var busy by remember { mutableStateOf(false) }
     var lastQ by remember { mutableStateOf("") }; var lastQT by remember { mutableLongStateOf(0L) }
     var auto by remember { mutableStateOf(true) }
     var locked by remember { mutableStateOf(false) }
+    var manualTrigger by remember { mutableStateOf(false) }
     var emptyFrames by remember { mutableIntStateOf(0) }
     var banner by remember { mutableStateOf<String?>(null) }
     var dlg by remember { mutableStateOf(false) }
-    val curFolder by rememberUpdatedState(activeFolder); val curAuto by rememberUpdatedState(auto)
+    var torch by remember { mutableStateOf(false) }
+    var extraRot by remember { mutableIntStateOf(0) }
+    var camCtrl by remember { mutableStateOf<Camera?>(null) }
 
-    fun vib() { try { if (Build.VERSION.SDK_INT >= 31) (ctx.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator.vibrate(VibrationEffect.createOneShot(60, -1)) else @Suppress("DEPRECATION") (ctx.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator).vibrate(60) } catch (_: Exception) {} }
-    LaunchedEffect(banner) { if (banner != null) { delay(1400); banner = null } }
+    val curFolder by rememberUpdatedState(activeFolder)
+    val curAuto by rememberUpdatedState(auto)
+    val curExtraRot by rememberUpdatedState(extraRot)
+    val tone = remember { try { ToneGenerator(AudioManager.STREAM_NOTIFICATION, 95) } catch (_: Exception) { null } }
+    DisposableEffect(Unit) { onDispose { tone?.release() } }
+
+    fun beepAndVib() {
+        try { tone?.startTone(ToneGenerator.TONE_PROP_BEEP, 130) } catch (_: Exception) {}
+        try { if (Build.VERSION.SDK_INT >= 31) (ctx.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator.vibrate(VibrationEffect.createOneShot(60, -1)) else @Suppress("DEPRECATION") (ctx.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator).vibrate(60) } catch (_: Exception) {}
+    }
+
+    LaunchedEffect(torch, camCtrl) { try { camCtrl?.cameraControl?.enableTorch(torch) } catch (_: Exception) {} }
+    LaunchedEffect(banner) { if (banner != null) { delay(1300); banner = null } }
     if (dlg) FolderDlg({ dlg = false }) { onNewFolder(it); onSelFolder(it.trim()); dlg = false }
     if (!perm) { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Button({ launch.launch(Manifest.permission.CAMERA) }) { Text("Разрешить камеру") } }; return }
 
@@ -169,25 +187,35 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
                     var lastT = 0L
                     an.setAnalyzer(Executors.newSingleThreadExecutor()) { px ->
                         val now = System.currentTimeMillis()
-                        if (now - lastT < 400) { px.close(); return@setAnalyzer }
+                        if (!manualTrigger && now - lastT < 380) { px.close(); return@setAnalyzer }
                         @androidx.camera.core.ExperimentalGetImage val img = px.image
                         if (img != null) {
                             lastT = now
-                            rec.process(InputImage.fromMediaImage(img, px.imageInfo.rotationDegrees)).addOnSuccessListener { v ->
-                                val p = parseCardClean(v); val t = System.currentTimeMillis()
+                            val rot = (px.imageInfo.rotationDegrees + curExtraRot) % 360
+                            val inImg = InputImage.fromMediaImage(img, rot)
+                            val w = inImg.width; val h = inImg.height
+                            val roi = Rect((w * 0.16f).toInt(), (h * 0.18f).toInt(), (w * 0.84f).toInt(), (h * 0.82f).toInt())
+                            rec.process(inImg).addOnSuccessListener { v ->
+                                val isManual = manualTrigger
+                                val p = parseCardClean(v, roi); val t = System.currentTimeMillis()
                                 if (p == null) {
+                                    if (isManual) {
+                                        manualTrigger = false
+                                        status = "В рамке не видно текста карты"
+                                    }
                                     emptyFrames++
                                     if (emptyFrames >= 3 && locked) {
                                         locked = false
                                         lastQ = ""
-                                        if (!busy) status = "Готов к следующей карте..."
+                                        if (!busy) status = "Рамка пуста — жду карту..."
                                     }
                                     return@addOnSuccessListener
                                 }
                                 emptyFrames = 0
-                                if (locked && curAuto) return@addOnSuccessListener
+                                if (!isManual && locked && curAuto) return@addOnSuccessListener
                                 val key = p.queries.firstOrNull() ?: return@addOnSuccessListener
-                                if (!busy && (key != lastQ || t - lastQT > 2500)) {
+                                if (!busy && (isManual || key != lastQ || t - lastQT > 2500)) {
+                                    manualTrigger = false
                                     lastQ = key; lastQT = t; status = "Ищу: ${p.displayLabel}"; busy = true
                                     scope.launch {
                                         try {
@@ -196,10 +224,10 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
                                             }
                                             if (card != null) {
                                                 found = card
-                                                if (curAuto && p.hasExactNumber && !locked) {
+                                                if (isManual || (curAuto && p.hasExactNumber && !locked)) {
                                                     locked = true
-                                                    onAdded(card); vib()
-                                                    status = "Готово: ${card.name} (уберите карту)"
+                                                    onAdded(card); beepAndVib()
+                                                    status = "ГОТОВО: ${card.name} → скидывайте в лоток"
                                                     banner = "+1 ${card.name} → ${curFolder ?: card.set.name}"
                                                 } else {
                                                     status = "Найдено: ${card.name} (${card.set.name} #${card.number})"
@@ -211,18 +239,73 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
                             }.addOnCompleteListener { px.close() }
                         } else px.close()
                     }
-                    try { prov.unbindAll(); prov.bindToLifecycle(owner, CameraSelector.DEFAULT_BACK_CAMERA, prev, an) } catch (_: Exception) {}
+                    try {
+                        prov.unbindAll()
+                        camCtrl = prov.bindToLifecycle(owner, CameraSelector.DEFAULT_BACK_CAMERA, prev, an)
+                    } catch (_: Exception) {}
                 }, ContextCompat.getMainExecutor(c))
             }
         }, modifier = Modifier.fillMaxSize())
 
-        Column(Modifier.align(Alignment.TopCenter).fillMaxWidth().padding(14.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-            Surface(color = Color.Black.copy(0.8f), shape = RoundedCornerShape(16.dp)) {
-                Column(Modifier.padding(14.dp, 8.dp)) {
+        // Визуальная рамка прицела + кнопка ручного фото
+        Column(
+            Modifier.align(Alignment.Center),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Box(
+                Modifier
+                    .fillMaxWidth(0.72f)
+                    .fillMaxHeight(0.50f)
+                    .border(
+                        width = if (locked) 4.dp else 2.dp,
+                        color = if (locked) Color(0xFF4CAF50) else Color(0xFFFFD54F).copy(alpha = 0.85f),
+                        shape = RoundedCornerShape(16.dp)
+                    )
+            ) {
+                Text(
+                    text = if (locked) "СЧИТАНО • СКИДЫВАЙ" else "ЗОНА СКАНА (${extraRot}°)",
+                    color = if (locked) Color(0xFF4CAF50) else Color(0xFFFFD54F),
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = 6.dp)
+                        .background(Color.Black.copy(0.65f), RoundedCornerShape(6.dp))
+                        .padding(8.dp, 2.dp)
+                )
+            }
+            Spacer(Modifier.height(10.dp))
+            FilledTonalButton(
+                onClick = {
+                    locked = false
+                    lastQ = ""
+                    manualTrigger = true
+                    status = "Ручной снимок..."
+                },
+                shape = CircleShape,
+                colors = ButtonDefaults.filledTonalButtonColors(
+                    containerColor = Color.Black.copy(0.82f),
+                    contentColor = Color.White
+                )
+            ) {
+                Icon(Icons.Default.PhotoCamera, null, modifier = Modifier.size(20.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Скан сейчас", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+            }
+        }
+
+        Column(Modifier.align(Alignment.TopCenter).fillMaxWidth().padding(12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Surface(color = Color.Black.copy(0.82f), shape = RoundedCornerShape(16.dp)) {
+                Column(Modifier.padding(12.dp, 8.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(status, color = Color.White, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-                        Text(if (auto) "Авто: ВКЛ" else "Авто: ВЫКЛ", color = if (auto) Color(0xFF4CAF50) else Color.LightGray, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                        Spacer(Modifier.width(6.dp)); Switch(auto, { auto = it; if (!it) locked = false })
+                        Text(status, color = Color.White, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                        IconButton({ torch = !torch }, Modifier.size(32.dp)) {
+                            Icon(if (torch) Icons.Default.FlashOn else Icons.Default.FlashOff, null, tint = if (torch) Color(0xFFFFD54F) else Color.White, modifier = Modifier.size(18.dp))
+                        }
+                        IconButton({ extraRot = (extraRot + 90) % 360; lastQ = ""; locked = false }, Modifier.size(32.dp)) {
+                            Icon(Icons.Default.RotateRight, null, tint = Color.White, modifier = Modifier.size(18.dp))
+                        }
+                        Switch(auto, { auto = it; if (!it) locked = false })
                     }
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         item { FilterChip(activeFolder == null, { onSelFolder(null) }, { Text("Родной сет", fontSize = 11.sp) }) }
@@ -231,21 +314,21 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
                     }
                 }
             }
-            banner?.let { Spacer(Modifier.height(8.dp)); Surface(color = Color(0xFF2E7D32), shape = RoundedCornerShape(20.dp)) { Text(it, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp, modifier = Modifier.padding(16.dp, 8.dp)) } }
+            banner?.let { Spacer(Modifier.height(6.dp)); Surface(color = Color(0xFF2E7D32), shape = RoundedCornerShape(20.dp)) { Text(it, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp, modifier = Modifier.padding(16.dp, 6.dp)) } }
         }
 
         found?.let { c ->
-            Card(Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(16.dp), shape = RoundedCornerShape(16.dp)) {
-                Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                    AsyncImage(c.images.small, c.name, Modifier.size(72.dp, 100.dp).clip(RoundedCornerShape(8.dp)))
-                    Spacer(Modifier.width(12.dp))
+            Card(Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(14.dp), shape = RoundedCornerShape(16.dp)) {
+                Row(Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    AsyncImage(c.images.small, c.name, Modifier.size(60.dp, 84.dp).clip(RoundedCornerShape(8.dp)))
+                    Spacer(Modifier.width(10.dp))
                     Column(Modifier.weight(1f)) {
-                        Text(c.name, fontWeight = FontWeight.Bold, fontSize = 18.sp)
-                        Text("В папку: ${activeFolder ?: c.set.name} • #${c.number}", fontSize = 12.sp, color = Color.Gray)
-                        Spacer(Modifier.height(8.dp))
+                        Text(c.name, fontWeight = FontWeight.Bold, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text("${activeFolder ?: c.set.name} • #${c.number}", fontSize = 12.sp, color = Color.Gray, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Spacer(Modifier.height(6.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Button({ onAdded(c); vib(); banner = "+1 ${c.name} → ${activeFolder ?: c.set.name}" }, Modifier.weight(1f)) { Text("+1 вручную") }
-                            OutlinedButton({ found = null; lastQ = ""; locked = false; status = "Жду карту..." }) { Text("Сброс") }
+                            Button({ onAdded(c); beepAndVib(); banner = "+1 ${c.name} → ${activeFolder ?: c.set.name}" }, Modifier.weight(1f)) { Text("+1", fontSize = 12.sp) }
+                            OutlinedButton({ found = null; lastQ = ""; locked = false; status = "Положите карту в рамку..." }) { Text("Сброс", fontSize = 12.sp) }
                         }
                     }
                 }
@@ -266,12 +349,22 @@ fun fixOcrDigits(s: String): String = s.map {
     }
 }.joinToString("")
 
-fun parseCardClean(vt: Text): ParsedCardInfo? {
-    val raw = vt.text; if (raw.isBlank()) return null
+fun parseCardClean(vt: Text, roi: Rect): ParsedCardInfo? {
+    val roiLines = vt.textBlocks
+        .flatMap { it.lines }
+        .filter { line ->
+            val b = line.boundingBox ?: return@filter false
+            roi.contains(b.centerX(), b.centerY())
+        }
+        .sortedBy { it.boundingBox?.top ?: Int.MAX_VALUE }
+
+    if (roiLines.isEmpty()) return null
+    val rawRoi = roiLines.joinToString("\n") { it.text }
+
     var num: String? = null
     var total: String? = null
 
-    val slashMatch = Regex("""\b([A-Za-z0-9|]{1,5})\s*/\s*([A-Za-z0-9|]{2,4})\b""").find(raw)
+    val slashMatch = Regex("""\b([A-Za-z0-9|]{1,5})\s*/\s*([A-Za-z0-9|]{2,4})\b""").find(rawRoi)
     if (slashMatch != null) {
         val leftRaw = slashMatch.groupValues[1]
         val rightFixed = fixOcrDigits(slashMatch.groupValues[2])
@@ -287,11 +380,10 @@ fun parseCardClean(vt: Text): ParsedCardInfo? {
         if (totDigits.isNotEmpty() && totDigits.toIntOrNull() in 10..400) total = totDigits
     }
 
-    val lines = vt.textBlocks.sortedBy { it.boundingBox?.top ?: Int.MAX_VALUE }.flatMap { it.lines }.sortedBy { it.boundingBox?.top ?: Int.MAX_VALUE }
     val badPrefix = Regex("""^(STAGE\s*\d*|STAG\w*|GTAG\w*|BASIC|BASI\w*|VMAX|VSTAR|TRAINER|SUPPORTER|ITEM|STADIUM|ENERGY)\s+""", RegexOption.IGNORE_CASE)
     val noise = setOf("BASIC", "STAGE", "STAGE 1", "STAGE 2", "VMAX", "VSTAR", "TRAINER", "SUPPORTER", "ITEM", "STADIUM", "ENERGY")
     var name: String? = null
-    for (l in lines.take(8)) {
+    for (l in roiLines.take(8)) {
         var t = l.text.trim()
             .replace(badPrefix, "")
             .replace(Regex("""\bHP\s*\d+\b|\b\d+\s*HP\b""", RegexOption.IGNORE_CASE), "")
