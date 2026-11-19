@@ -73,6 +73,7 @@ import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
 import retrofit2.http.Body
 import retrofit2.http.GET
+import retrofit2.http.Header
 import retrofit2.http.POST
 import retrofit2.http.Path
 import retrofit2.http.Query
@@ -83,12 +84,6 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 
-fun defaultGeminiKey(): String = listOf(
-    "AQ.Ab8RN6IGfkJLEvriv",
-    "GMEwxxVM5z07ZIXTka",
-    "XyGuznQk33PrpAw"
-).joinToString("")
-
 data class ApiResponse(val data: List<PokemonCardDto>)
 data class PokemonCardDto(val id: String, val name: String, val number: String, val set: CardSetDto, val images: CardImagesDto)
 data class CardSetDto(val name: String)
@@ -96,7 +91,7 @@ data class CardImagesDto(val small: String, val large: String)
 data class CollectedCard(val id: String, val name: String, val number: String, val setName: String, val imageUrl: String, val count: Int, val finish: String? = "Normal")
 data class ParsedCardInfo(val name: String, val queries: List<String>, val displayLabel: String, val hasExactNumber: Boolean, val nameBox: Rect?)
 
-// --- Gemini / Vertex AI REST Models ---
+// --- Gemini REST Models ---
 data class GeminiRequest(val contents: List<GeminiContent>, val generationConfig: GeminiGenConfig? = GeminiGenConfig())
 data class GeminiGenConfig(val temperature: Double = 0.1, val responseMimeType: String = "application/json")
 data class GeminiContent(val role: String = "user", val parts: List<GeminiPart>)
@@ -124,20 +119,11 @@ interface PokemonTcgApi {
     suspend fun searchCards(@Query("q") q: String, @Query("pageSize") ps: Int = 1, @Query("select") s: String = "id,name,number,set,images"): ApiResponse
 }
 
-interface VertexGeminiApi {
-    @POST("v1/publishers/google/models/{model}:generateContent")
-    suspend fun analyzeCard(
-        @Path("model") model: String,
-        @Query("key") apiKey: String,
-        @Body body: GeminiRequest
-    ): GeminiResponse
-}
-
-interface StudioGeminiApi {
+interface GeminiApi {
     @POST("v1beta/models/{model}:generateContent")
     suspend fun analyzeCard(
         @Path("model") model: String,
-        @Query("key") apiKey: String,
+        @Header("x-goog-api-key") apiKey: String,
         @Body body: GeminiRequest
     ): GeminiResponse
 }
@@ -157,22 +143,13 @@ object ApiClient {
             .create(PokemonTcgApi::class.java)
     }
 
-    val vertexGemini: VertexGeminiApi by lazy {
-        Retrofit.Builder()
-            .baseUrl("https://aiplatform.googleapis.com/")
-            .client(okHttp)
-            .addConverterFactory(GsonConverterFactory.create())
-            .build()
-            .create(VertexGeminiApi::class.java)
-    }
-
-    val studioGemini: StudioGeminiApi by lazy {
+    val gemini: GeminiApi by lazy {
         Retrofit.Builder()
             .baseUrl("https://generativelanguage.googleapis.com/")
             .client(okHttp)
             .addConverterFactory(GsonConverterFactory.create())
             .build()
-            .create(StudioGeminiApi::class.java)
+            .create(GeminiApi::class.java)
     }
 
     val cache = ConcurrentHashMap<String, PokemonCardDto>()
@@ -201,11 +178,8 @@ class CollectionRepository(ctx: Context) {
     fun saveCards(c: List<CollectedCard>) = cf.writeText(gson.toJson(c))
     fun loadFolders(): List<String> = try { if (!ff.exists()) emptyList() else gson.fromJson(ff.readText(), object : TypeToken<List<String>>() {}.type) ?: emptyList() } catch (_: Exception) { emptyList() }
     fun saveFolders(f: List<String>) = ff.writeText(gson.toJson(f))
-    fun loadApiKey(): String {
-        val saved = prefs.getString("gemini_key_v2", null)
-        return if (saved.isNullOrBlank()) defaultGeminiKey() else saved
-    }
-    fun saveApiKey(k: String) = prefs.edit().putString("gemini_key_v2", k.trim()).apply()
+    fun loadApiKey(): String = prefs.getString("gemini_key_v3", "") ?: ""
+    fun saveApiKey(k: String) = prefs.edit().putString("gemini_key_v3", k.trim()).apply()
 }
 
 class MainActivity : ComponentActivity() {
@@ -338,17 +312,12 @@ suspend fun identifyWithGemini(apiKey: String, base64Jpeg: String): GeminiCardRe
         "gemini-2.0-flash"
     ).distinct()
 
-    val isVertexKey = cleanKey.startsWith("AQ.")
     var resp: GeminiResponse? = null
     var lastError: Exception? = null
 
     for (mod in models) {
         try {
-            resp = if (isVertexKey) {
-                ApiClient.vertexGemini.analyzeCard(mod, cleanKey, req)
-            } else {
-                ApiClient.studioGemini.analyzeCard(mod, cleanKey, req)
-            }
+            resp = ApiClient.gemini.analyzeCard(mod, cleanKey, req)
             ApiClient.workingModel = mod
             break
         } catch (e: HttpException) {
@@ -357,8 +326,6 @@ suspend fun identifyWithGemini(apiKey: String, base64Jpeg: String): GeminiCardRe
             val errBody = try { e.response()?.errorBody()?.string() } catch (_: Exception) { null }
             val msg = errBody?.let { Regex("\"message\"\\s*:\\s*\"([^\"]+)\"").find(it)?.groupValues?.get(1) } ?: "HTTP ${e.code()}"
             throw Exception(msg)
-        } catch (e: Exception) {
-            throw e
         }
     }
 
@@ -390,8 +357,8 @@ fun ScannerScreen(
     var found by remember { mutableStateOf<PokemonCardDto?>(null) }
     var busy by remember { mutableStateOf(false) }
     var auto by remember { mutableStateOf(true) }
-    var useGemini by remember { mutableStateOf(true) }
-    var finishMode by remember { mutableStateOf("Авто") }
+    var useGemini by remember { mutableStateOf(apiKey.isNotBlank()) }
+    var finishMode by remember { mutableStateOf(if (apiKey.isNotBlank()) "Авто" else "Normal") }
     var lastAddedSig by remember { mutableStateOf("") }
     var lastAddedBox by remember { mutableStateOf<Rect?>(null) }
     var lastAddTime by remember { mutableLongStateOf(0L) }
@@ -421,9 +388,20 @@ fun ScannerScreen(
     LaunchedEffect(banner) { if (banner != null) { delay(1300); banner = null } }
     if (dlg) FolderDlg({ dlg = false }) { onNewFolder(it); onSelFolder(it.trim()); dlg = false }
     if (keyDlg) ApiKeyDlg(apiKey, { keyDlg = false }) {
-        onSaveApiKey(it)
+        val trimmed = it.trim()
+        onSaveApiKey(trimmed)
         keyDlg = false
-        status = if (it.trim().isNotEmpty()) "Ключ сохранён — кладите карту..." else "Ключ пустой (работает OCR)"
+        if (trimmed.isNotEmpty()) {
+            useGemini = true
+            finishMode = "Авто"
+            lastAddedSig = ""
+            lastAddedBox = null
+            status = "Ключ сохранён — Gemini AI готов!"
+        } else {
+            useGemini = false
+            finishMode = "Normal"
+            status = "Режим: Локальный OCR"
+        }
     }
     if (!perm) { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Button({ launch.launch(Manifest.permission.CAMERA) }) { Text("Разрешить камеру") } }; return }
 
@@ -497,7 +475,10 @@ fun ScannerScreen(
                                                 val apiSetId = gCode?.let { SET_CODE_MAP[it] }
 
                                                 val queries = mutableListOf<String>()
-                                                if (apiSetId != null && gNum != null) queries.add("name:\"$gName\" set.id:$apiSetId number:$gNum")
+                                                if (apiSetId != null && gNum != null) {
+                                                    queries.add("name:\"$gName\" set.id:$apiSetId number:$gNum")
+                                                    queries.add("set.id:$apiSetId number:$gNum")
+                                                }
                                                 if (gNum != null && !gTot.isNullOrEmpty()) queries.add("name:\"$gName\" number:$gNum set.printedTotal:$gTot")
                                                 if (gNum != null) queries.add("name:\"$gName\" number:$gNum")
                                                 queries.add("name:\"$gName\"")
@@ -541,15 +522,15 @@ fun ScannerScreen(
                                     return@addOnSuccessListener
                                 }
 
-                                // --- РЕЗЕРВНЫЙ ЛОКАЛЬНЫЙ OCR ---
+                                // --- ЛОКАЛЬНЫЙ OCR ---
                                 val p = parseCardClean(v, allowNameOnly = isManual) ?: run {
-                                    if (isManual) { manualTrigger = false; status = "Текст карты не виден" }
+                                    if (isManual) { manualTrigger = false; status = "OCR: не вижу имя/номер" }
                                     return@addOnSuccessListener
                                 }
                                 val key = p.queries.firstOrNull() ?: return@addOnSuccessListener
                                 manualTrigger = false
                                 busy = true
-                                status = "OCR ищу: ${p.displayLabel}"
+                                status = "OCR: ${p.displayLabel}"
                                 scope.launch {
                                     try {
                                         val card = ApiClient.cache[key] ?: withContext(Dispatchers.IO) {
@@ -567,8 +548,10 @@ fun ScannerScreen(
                                                 status = "Готово: ${card.name} [$finalFin]"
                                                 banner = "+1 ${card.name} [$finalFin] → ${curFolder ?: card.set.name}"
                                             }
-                                        } else status = "Не найдено: ${p.displayLabel}"
-                                    } catch (_: Exception) {} finally { busy = false }
+                                        } else status = "Нет в базе: ${p.displayLabel}"
+                                    } catch (e: Exception) {
+                                        status = "Сеть: ${e.message?.take(30) ?: "ошибка"}"
+                                    } finally { busy = false }
                                 }
                             }.addOnCompleteListener { px.close() }
                         } else px.close()
@@ -587,7 +570,7 @@ fun ScannerScreen(
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
                             Text(status, color = Color.White, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            if (subInfo.isNotEmpty()) {
+                            if (subInfo.isNotEmpty() && useGemini) {
                                 Text(subInfo, color = Color(0xFF81D4FA), fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             }
                         }
@@ -606,8 +589,17 @@ fun ScannerScreen(
                         item {
                             FilterChip(
                                 selected = useGemini,
-                                onClick = { useGemini = !useGemini; lastAddedSig = "" },
-                                label = { Text(if (useGemini) "✨ Gemini AI" else "OCR", fontSize = 11.sp, fontWeight = FontWeight.Bold) }
+                                onClick = {
+                                    if (!useGemini && apiKey.isBlank()) {
+                                        keyDlg = true
+                                    } else {
+                                        useGemini = !useGemini
+                                        lastAddedSig = ""
+                                        lastAddedBox = null
+                                        status = if (useGemini) "Режим: Gemini AI" else "Режим: Локальный OCR"
+                                    }
+                                },
+                                label = { Text(if (useGemini) "✨ Gemini AI" else "📷 OCR", fontSize = 11.sp, fontWeight = FontWeight.Bold) }
                             )
                         }
                         items(listOf("Авто", "Normal", "Reverse", "Holo")) { m ->
@@ -652,7 +644,7 @@ fun ScannerScreen(
                     lastAddedSig = ""
                     lastAddedBox = null
                     manualTrigger = true
-                    status = "Снимок для Gemini..."
+                    status = "Ручной снимок..."
                 },
                 shape = CircleShape,
                 colors = ButtonDefaults.filledTonalButtonColors(
@@ -678,7 +670,7 @@ fun ApiKeyDlg(currentKey: String, onDim: () -> Unit, onSave: (String) -> Unit) {
             OutlinedTextField(
                 value = k,
                 onValueChange = { k = it },
-                placeholder = { Text("Вставьте ключ AI Studio / Vertex...") },
+                placeholder = { Text("Вставьте ключ из Google AI Studio...") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth()
             )
@@ -720,15 +712,14 @@ fun parseCardClean(vt: Text, allowNameOnly: Boolean = false): ParsedCardInfo? {
         }
         val totDigits = rightFixed.filter { it.isDigit() }.trimStart('0')
         if (totDigits.isNotEmpty() && totDigits.toIntOrNull() in 10..400) total = totDigits
+    }
 
-        val beforeSlash = raw.substring(0, slashMatch.range.first).takeLast(28)
-        val codeCandidates = Regex("""\b([A-Z0-9]{3})\b""").findAll(beforeSlash.uppercase()).map { it.groupValues[1] }.toList()
-        for (cand in codeCandidates.asReversed()) {
-            val fixedCode = cand.replace('0', 'O').replace('1', 'I').replace('5', 'S').replace('8', 'B')
-            if (SET_CODE_MAP.containsKey(fixedCode)) {
-                setCode = fixedCode
-                break
-            }
+    val allUpperTokens = Regex("""\b([A-Z0-9]{3})\b""").findAll(raw.uppercase()).map { it.groupValues[1] }.toList()
+    for (cand in allUpperTokens.asReversed()) {
+        val fixedCode = cand.replace('0', 'O').replace('1', 'I').replace('5', 'S').replace('8', 'B')
+        if (SET_CODE_MAP.containsKey(fixedCode)) {
+            setCode = fixedCode
+            break
         }
     }
 
@@ -737,7 +728,7 @@ fun parseCardClean(vt: Text, allowNameOnly: Boolean = false): ParsedCardInfo? {
     val noise = setOf("BASIC", "STAGE", "STAGE 1", "STAGE 2", "VMAX", "VSTAR", "TRAINER", "SUPPORTER", "ITEM", "STADIUM", "ENERGY", "WEAKNESS", "RESISTANCE", "RETREAT")
     var name: String? = null
     var nameBox: Rect? = null
-    for (l in lines.take(6)) {
+    for (l in lines.take(10)) {
         var t = l.text.trim()
             .replace(badPrefix, "")
             .replace(Regex("""\bHP\s*\d+\b|\b\d+\s*HP\b""", RegexOption.IGNORE_CASE), "")
@@ -761,7 +752,10 @@ fun parseCardClean(vt: Text, allowNameOnly: Boolean = false): ParsedCardInfo? {
     val apiSetId = setCode?.let { SET_CODE_MAP[it] }
     val qs = mutableListOf<String>()
 
-    if (apiSetId != null && num != null) qs.add("name:\"$n\" set.id:$apiSetId number:$num")
+    if (apiSetId != null && num != null) {
+        qs.add("name:\"$n\" set.id:$apiSetId number:$num")
+        qs.add("set.id:$apiSetId number:$num")
+    }
     if (num != null && total != null) qs.add("name:\"$n\" number:$num set.printedTotal:$total")
     if (num != null) qs.add("name:\"$n\" number:$num")
     if (qs.isEmpty()) {
