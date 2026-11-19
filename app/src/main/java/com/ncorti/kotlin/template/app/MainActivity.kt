@@ -83,6 +83,19 @@ object ApiClient {
     val cache = ConcurrentHashMap<String, PokemonCardDto>()
 }
 
+val SET_CODE_MAP = mapOf(
+    "SVI" to "sv1", "PAL" to "sv2", "OBF" to "sv3", "MEW" to "sv3pt5",
+    "PAR" to "sv4", "PAF" to "sv4pt5", "TEF" to "sv5", "TWM" to "sv6",
+    "SFA" to "sv6pt5", "SCR" to "sv7", "SSP" to "sv8", "PRE" to "sv8pt5",
+    "JTG" to "sv9", "DRI" to "sv10", "BLK" to "zsv10pt5", "WHT" to "rsv10pt5",
+    "SVP" to "svp", "SVE" to "sve",
+    "SSH" to "swsh1", "RCL" to "swsh2", "DAA" to "swsh3", "CPA" to "swsh35",
+    "VIV" to "swsh4", "SHF" to "swsh45", "BST" to "swsh5", "CRE" to "swsh6",
+    "EVS" to "swsh7", "CEL" to "cel25", "FST" to "swsh8", "BRS" to "swsh9",
+    "ASR" to "swsh10", "PGO" to "pgo", "LOR" to "swsh11", "SIT" to "swsh12",
+    "CRZ" to "swsh12pt5"
+)
+
 class CollectionRepository(ctx: Context) {
     private val cf = File(ctx.filesDir, "pokemon_collection.json")
     private val ff = File(ctx.filesDir, "custom_folders.json")
@@ -205,11 +218,11 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
                             val inImg = InputImage.fromMediaImage(img, rot)
                             rec.process(inImg).addOnSuccessListener { v ->
                                 val isManual = manualTrigger
-                                val p = parseCardClean(v); val t = System.currentTimeMillis()
+                                val p = parseCardClean(v, allowNameOnly = isManual); val t = System.currentTimeMillis()
                                 if (p == null) {
                                     if (isManual) {
                                         manualTrigger = false
-                                        status = "Текст карты не виден"
+                                        status = "Номер/код сета не видны"
                                     }
                                     emptyFrames++
                                     if (emptyFrames >= 3 && locked) {
@@ -288,6 +301,24 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
             Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(14.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
+            found?.let { c ->
+                Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)) {
+                    Row(Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                        AsyncImage(c.images.small, c.name, Modifier.size(60.dp, 84.dp).clip(RoundedCornerShape(8.dp)))
+                        Spacer(Modifier.width(10.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text("${c.name} [$finishMode]", fontWeight = FontWeight.Bold, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text("${activeFolder ?: c.set.name} • #${c.number}", fontSize = 12.sp, color = Color.Gray, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Spacer(Modifier.height(6.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Button({ onAdded(c, finishMode); beepAndVib(); banner = "+1 ${c.name} [$finishMode]" }, Modifier.weight(1f)) { Text("+1", fontSize = 12.sp) }
+                                OutlinedButton({ found = null; lastQ = ""; locked = false; status = "Наведите камеру..." }) { Text("Сброс", fontSize = 12.sp) }
+                            }
+                        }
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+            }
             FilledTonalButton(
                 onClick = {
                     locked = false
@@ -305,25 +336,6 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
                 Spacer(Modifier.width(8.dp))
                 Text("Скан сейчас", fontWeight = FontWeight.Bold, fontSize = 13.sp)
             }
-
-            found?.let { c ->
-                Spacer(Modifier.height(10.dp))
-                Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)) {
-                    Row(Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
-                        AsyncImage(c.images.small, c.name, Modifier.size(60.dp, 84.dp).clip(RoundedCornerShape(8.dp)))
-                        Spacer(Modifier.width(10.dp))
-                        Column(Modifier.weight(1f)) {
-                            Text("${c.name} [$finishMode]", fontWeight = FontWeight.Bold, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            Text("${activeFolder ?: c.set.name} • #${c.number}", fontSize = 12.sp, color = Color.Gray, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            Spacer(Modifier.height(6.dp))
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Button({ onAdded(c, finishMode); beepAndVib(); banner = "+1 ${c.name} [$finishMode]" }, Modifier.weight(1f)) { Text("+1", fontSize = 12.sp) }
-                                OutlinedButton({ found = null; lastQ = ""; locked = false; status = "Наведите камеру..." }) { Text("Сброс", fontSize = 12.sp) }
-                            }
-                        }
-                    }
-                }
-            }
         }
     }
 }
@@ -340,10 +352,11 @@ fun fixOcrDigits(s: String): String = s.map {
     }
 }.joinToString("")
 
-fun parseCardClean(vt: Text): ParsedCardInfo? {
+fun parseCardClean(vt: Text, allowNameOnly: Boolean = false): ParsedCardInfo? {
     val raw = vt.text; if (raw.isBlank()) return null
     var num: String? = null
     var total: String? = null
+    var setCode: String? = null
 
     val slashMatch = Regex("""\b([A-Za-z0-9|]{1,5})\s*/\s*([A-Za-z0-9|]{2,4})\b""").find(raw)
     if (slashMatch != null) {
@@ -359,6 +372,29 @@ fun parseCardClean(vt: Text): ParsedCardInfo? {
         }
         val totDigits = rightFixed.filter { it.isDigit() }.trimStart('0')
         if (totDigits.isNotEmpty() && totDigits.toIntOrNull() in 10..400) total = totDigits
+
+        // Ищем 3-буквенный код сета перед дробью (например, WHT, MEW, SVI, OBF, PAL, PAR)
+        val beforeSlash = raw.substring(0, slashMatch.range.first).takeLast(28)
+        val codeCandidates = Regex("""\b([A-Z0-9]{3})\b""").findAll(beforeSlash.uppercase()).map { it.groupValues[1] }.toList()
+        for (cand in codeCandidates.asReversed()) {
+            val fixedCode = cand.replace('0', 'O').replace('1', 'I').replace('5', 'S').replace('8', 'B')
+            if (SET_CODE_MAP.containsKey(fixedCode)) {
+                setCode = fixedCode
+                break
+            }
+        }
+    }
+
+    // Если код сета не нашелся прямо перед дробью — ищем его в последних строках карты (левый нижний угол)
+    if (setCode == null) {
+        val tailText = raw.takeLast(140).uppercase()
+        for (m in Regex("""\b([A-Z0-9]{3})\b""").findAll(tailText)) {
+            val fixedCode = m.groupValues[1].replace('0', 'O').replace('1', 'I').replace('5', 'S').replace('8', 'B')
+            if (SET_CODE_MAP.containsKey(fixedCode)) {
+                setCode = fixedCode
+                break
+            }
+        }
     }
 
     val lines = vt.textBlocks.sortedBy { it.boundingBox?.top ?: Int.MAX_VALUE }.flatMap { it.lines }.sortedBy { it.boundingBox?.top ?: Int.MAX_VALUE }
@@ -371,6 +407,7 @@ fun parseCardClean(vt: Text): ParsedCardInfo? {
             .replace(Regex("""\bHP\s*\d+\b|\b\d+\s*HP\b""", RegexOption.IGNORE_CASE), "")
             .replace(Regex("""[^a-zA-Z0-9\s.'-]"""), "")
             .trim()
+        t = t.replace(Regex("""(?<=[a-zA-Z]{3})\d{2,3}$"""), "").trim()
         val w = t.split(Regex("""\s+""")).toMutableList()
         while (w.size >= 2 && w[0].length in 2..6 && w[0].count { it.isUpperCase() } >= 2 && w[1][0].isUpperCase() && w[1].drop(1).any { it.isLowerCase() }) {
             w.removeAt(0)
@@ -382,12 +419,34 @@ fun parseCardClean(vt: Text): ParsedCardInfo? {
             break
         }
     }
-    val n = name ?: return null
+
+    val apiSetId = setCode?.let { SET_CODE_MAP[it] }
     val qs = mutableListOf<String>()
-    if (num != null && total != null) qs.add("name:\"$n\" number:$num set.printedTotal:$total")
-    if (num != null) qs.add("name:\"$n\" number:$num")
-    if (qs.isEmpty()) qs.add("name:\"$n\"")
-    val label = if (num != null) "$n #$num" + (total?.let { "/$it" } ?: "") else n
+
+    // 1. Точный поиск по коду сета + номеру (работает даже если имя не прочиталось!)
+    if (apiSetId != null && num != null) {
+        qs.add("set.id:$apiSetId number:$num")
+    }
+    // 2. Поиск по имени + номеру + общему числу карт в сете
+    if (name != null && num != null && total != null) {
+        qs.add("name:\"$name\" number:$num set.printedTotal:$total")
+    }
+    // 3. Поиск по имени + номеру
+    if (name != null && num != null) {
+        qs.add("name:\"$name\" number:$num")
+    }
+    // 4. Запасной поиск только по имени — только при ручном нажатии
+    if (qs.isEmpty()) {
+        if (!allowNameOnly || name == null) return null
+        qs.add("name:\"$name\"")
+    }
+
+    val label = buildString {
+        if (setCode != null) append("$setCode ")
+        if (name != null) append("$name ")
+        if (num != null) append("#$num" + (total?.let { "/$it" } ?: ""))
+    }.trim()
+
     return ParsedCardInfo(qs, label, num != null)
 }
 
