@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Color as AndroidColor
 import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.Rect
@@ -18,7 +19,6 @@ import android.os.Bundle
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
-import android.util.Base64
 import android.view.ViewGroup
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -28,9 +28,11 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -45,7 +47,11 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
@@ -57,81 +63,101 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import coil.compose.AsyncImage
 import com.google.gson.Gson
-import com.google.gson.annotations.SerializedName
 import com.google.gson.reflect.TypeToken
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.text.Text
-import com.google.mlkit.vision.text.TextRecognition
-import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
-import retrofit2.HttpException
+import okhttp3.Request
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
-import retrofit2.http.Body
 import retrofit2.http.GET
-import retrofit2.http.Header
-import retrofit2.http.POST
-import retrofit2.http.Path
 import retrofit2.http.Query
 import java.io.ByteArrayOutputStream
 import java.io.File
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 
 data class ApiResponse(val data: List<PokemonCardDto>)
 data class PokemonCardDto(val id: String, val name: String, val number: String, val set: CardSetDto, val images: CardImagesDto)
-data class CardSetDto(val name: String)
+data class CardSetDto(val id: String? = null, val name: String)
 data class CardImagesDto(val small: String, val large: String)
-data class CollectedCard(val id: String, val name: String, val number: String, val setName: String, val imageUrl: String, val count: Int, val finish: String? = "Normal")
-data class ParsedCardInfo(val name: String, val queries: List<String>, val displayLabel: String, val hasExactNumber: Boolean, val nameBox: Rect?)
 
-// --- Gemini REST Models ---
-data class GeminiRequest(val contents: List<GeminiContent>, val generationConfig: GeminiGenConfig? = GeminiGenConfig())
-data class GeminiGenConfig(val temperature: Double = 0.1, val responseMimeType: String = "application/json")
-data class GeminiContent(val role: String = "user", val parts: List<GeminiPart>)
-data class GeminiPart(
-    val text: String? = null,
-    @SerializedName("inline_data") val inlineData: GeminiInlineData? = null
-)
-data class GeminiInlineData(
-    @SerializedName("mime_type") val mimeType: String,
-    val data: String
-)
-data class GeminiResponse(val candidates: List<GeminiCandidate>?)
-data class GeminiCandidate(val content: GeminiContent?)
-data class GeminiCardResult(
-    val hasCard: Boolean = false,
-    val name: String? = null,
-    val number: String? = null,
-    val total: String? = null,
-    val setCode: String? = null,
+data class CollectedCard(
+    val id: String,
+    val name: String,
+    val number: String,
+    val setName: String,
+    val imageUrl: String,
+    val count: Int,
     val finish: String? = "Normal"
+)
+
+data class HashedCard(
+    val id: String,
+    val name: String,
+    val number: String,
+    val setId: String,
+    val setName: String,
+    val imageUrl: String,
+    val dHash: Long,
+    val colorSig: IntArray
+) {
+    fun toDto() = PokemonCardDto(id, name, number, CardSetDto(setId, setName), CardImagesDto(imageUrl, imageUrl))
+}
+
+data class SetPreset(val code: String, val apiId: String, val title: String)
+
+val AVAILABLE_SETS = listOf(
+    SetPreset("WHT", "rsv10pt5", "White Flare (WHT)"),
+    SetPreset("BLK", "zsv10pt5", "Black Bolt (BLK)"),
+    SetPreset("DRI", "sv10", "Destined Rivals (DRI)"),
+    SetPreset("JTG", "sv9", "Journey Together (JTG)"),
+    SetPreset("PRE", "sv8pt5", "Prismatic Evolutions (PRE)"),
+    SetPreset("SSP", "sv8", "Surging Sparks (SSP)"),
+    SetPreset("SCR", "sv7", "Stellar Crown (SCR)"),
+    SetPreset("SFA", "sv6pt5", "Shrouded Fable (SFA)"),
+    SetPreset("TWM", "sv6", "Twilight Masquerade (TWM)"),
+    SetPreset("TEF", "sv5", "Temporal Forces (TEF)"),
+    SetPreset("PAF", "sv4pt5", "Paldean Fates (PAF)"),
+    SetPreset("PAR", "sv4", "Paradox Rift (PAR)"),
+    SetPreset("MEW", "sv3pt5", "151 (MEW)"),
+    SetPreset("OBF", "sv3", "Obsidian Flames (OBF)"),
+    SetPreset("PAL", "sv2", "Paldea Evolved (PAL)"),
+    SetPreset("SVI", "sv1", "Scarlet & Violet (SVI)"),
+    SetPreset("SVP", "svp", "SV Black Star Promos (SVP)"),
+    SetPreset("CRZ", "swsh12pt5", "Crown Zenith (CRZ)"),
+    SetPreset("SIT", "swsh12", "Silver Tempest (SIT)"),
+    SetPreset("LOR", "swsh11", "Lost Origin (LOR)"),
+    SetPreset("PGO", "pgo", "Pokémon GO (PGO)"),
+    SetPreset("ASR", "swsh10", "Astral Radiance (ASR)"),
+    SetPreset("BRS", "swsh9", "Brilliant Stars (BRS)"),
+    SetPreset("FST", "swsh8", "Fusion Strike (FST)"),
+    SetPreset("CEL", "cel25", "Celebrations (CEL)"),
+    SetPreset("EVS", "swsh7", "Evolving Skies (EVS)")
 )
 
 interface PokemonTcgApi {
     @GET("v2/cards")
-    suspend fun searchCards(@Query("q") q: String, @Query("pageSize") ps: Int = 1, @Query("select") s: String = "id,name,number,set,images"): ApiResponse
-}
-
-interface GeminiApi {
-    @POST("v1beta/models/{model}:generateContent")
-    suspend fun analyzeCard(
-        @Path("model") model: String,
-        @Header("x-goog-api-key") apiKey: String,
-        @Body body: GeminiRequest
-    ): GeminiResponse
+    suspend fun getCardsBySet(
+        @Query("q") q: String,
+        @Query("pageSize") ps: Int = 250,
+        @Query("page") page: Int = 1,
+        @Query("select") s: String = "id,name,number,set,images"
+    ): ApiResponse
 }
 
 object ApiClient {
-    private val okHttp = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(20, TimeUnit.SECONDS)
+    val okHttp: OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
         .build()
 
     val api: PokemonTcgApi by lazy {
@@ -142,44 +168,109 @@ object ApiClient {
             .build()
             .create(PokemonTcgApi::class.java)
     }
-
-    val gemini: GeminiApi by lazy {
-        Retrofit.Builder()
-            .baseUrl("https://generativelanguage.googleapis.com/")
-            .client(okHttp)
-            .addConverterFactory(GsonConverterFactory.create())
-            .build()
-            .create(GeminiApi::class.java)
-    }
-
-    val cache = ConcurrentHashMap<String, PokemonCardDto>()
-    @Volatile var workingModel: String? = null
 }
 
-val SET_CODE_MAP = mapOf(
-    "SVI" to "sv1", "PAL" to "sv2", "OBF" to "sv3", "MEW" to "sv3pt5",
-    "PAR" to "sv4", "PAF" to "sv4pt5", "TEF" to "sv5", "TWM" to "sv6",
-    "SFA" to "sv6pt5", "SCR" to "sv7", "SSP" to "sv8", "PRE" to "sv8pt5",
-    "JTG" to "sv9", "DRI" to "sv10", "BLK" to "zsv10pt5", "WHT" to "rsv10pt5",
-    "SVP" to "svp", "SVE" to "sve",
-    "SSH" to "swsh1", "RCL" to "swsh2", "DAA" to "swsh3", "CPA" to "swsh35",
-    "VIV" to "swsh4", "SHF" to "swsh45", "BST" to "swsh5", "CRE" to "swsh6",
-    "EVS" to "swsh7", "CEL" to "cel25", "FST" to "swsh8", "BRS" to "swsh9",
-    "ASR" to "swsh10", "PGO" to "pgo", "LOR" to "swsh11", "SIT" to "swsh12",
-    "CRZ" to "swsh12pt5"
-)
+// --- Visual Hashing Engine (dHash 64-bit + RGB Color Grid) ---
+object VisualMatcher {
+    fun computeSignature(bmp: Bitmap): Pair<Long, IntArray> {
+        // Вычисляем dHash на сетке 9x8 (64 бита)
+        val gray = Bitmap.createScaledBitmap(bmp, 9, 8, true)
+        var hash = 0L
+        var bit = 0
+        for (y in 0 until 8) {
+            for (x in 0 until 8) {
+                val p1 = gray.getPixel(x, y)
+                val p2 = gray.getPixel(x + 1, y)
+                val l1 = (AndroidColor.red(p1) * 77 + AndroidColor.green(p1) * 150 + AndroidColor.blue(p1) * 29) shr 8
+                val l2 = (AndroidColor.red(p2) * 77 + AndroidColor.green(p2) * 150 + AndroidColor.blue(p2) * 29) shr 8
+                if (l1 > l2) {
+                    hash = hash or (1L shl bit)
+                }
+                bit++
+            }
+        }
+        gray.recycle()
+
+        // Цветовая сигнатура 4x4 (16 зон * 3 канала = 48 значений)
+        val small = Bitmap.createScaledBitmap(bmp, 4, 4, true)
+        val sig = IntArray(48)
+        var idx = 0
+        for (y in 0 until 4) {
+            for (x in 0 until 4) {
+                val px = small.getPixel(x, y)
+                sig[idx++] = AndroidColor.red(px)
+                sig[idx++] = AndroidColor.green(px)
+                sig[idx++] = AndroidColor.blue(px)
+            }
+        }
+        small.recycle()
+        return hash to sig
+    }
+
+    fun findBestMatch(
+        frameHash: Long,
+        frameColor: IntArray,
+        db: List<HashedCard>,
+        activeSetFilter: String? = null
+    ): Pair<HashedCard, Int>? {
+        if (db.isEmpty()) return null
+        val pool = if (activeSetFilter != null) {
+            db.filter { it.setId == activeSetFilter }.ifEmpty { db }
+        } else db
+
+        var bestCard: HashedCard? = null
+        var bestScore = Int.MAX_VALUE
+
+        for (c in pool) {
+            val hamming = java.lang.Long.bitCount(frameHash xor c.dHash)
+            if (hamming > 22) continue // Быстрый отсев непохожих карт
+
+            var colorDiff = 0
+            val cSig = c.colorSig
+            if (cSig.size == 48) {
+                for (i in 0 until 48) {
+                    colorDiff += abs(frameColor[i] - cSig[i])
+                }
+            }
+            // Комбинированный скор: структура + цвет
+            val score = hamming * 35 + (colorDiff / 48)
+            if (score < bestScore) {
+                bestScore = score
+                bestCard = c
+            }
+        }
+
+        // Порог уверенного совпадения (чем меньше score, тем точнее)
+        return if (bestCard != null && bestScore <= 620) bestCard to bestScore else null
+    }
+}
 
 class CollectionRepository(ctx: Context) {
     private val cf = File(ctx.filesDir, "pokemon_collection.json")
     private val ff = File(ctx.filesDir, "custom_folders.json")
-    private val prefs = ctx.getSharedPreferences("poke_prefs", Context.MODE_PRIVATE)
+    private val hf = File(ctx.filesDir, "visual_hashes_v1.json")
     private val gson = Gson()
-    fun loadCards(): List<CollectedCard> = try { if (!cf.exists()) emptyList() else gson.fromJson(cf.readText(), object : TypeToken<List<CollectedCard>>() {}.type) ?: emptyList() } catch (_: Exception) { emptyList() }
+
+    fun loadCards(): List<CollectedCard> = try {
+        if (!cf.exists()) emptyList()
+        else gson.fromJson(cf.readText(), object : TypeToken<List<CollectedCard>>() {}.type) ?: emptyList()
+    } catch (_: Exception) { emptyList() }
+
     fun saveCards(c: List<CollectedCard>) = cf.writeText(gson.toJson(c))
-    fun loadFolders(): List<String> = try { if (!ff.exists()) emptyList() else gson.fromJson(ff.readText(), object : TypeToken<List<String>>() {}.type) ?: emptyList() } catch (_: Exception) { emptyList() }
+
+    fun loadFolders(): List<String> = try {
+        if (!ff.exists()) emptyList()
+        else gson.fromJson(ff.readText(), object : TypeToken<List<String>>() {}.type) ?: emptyList()
+    } catch (_: Exception) { emptyList() }
+
     fun saveFolders(f: List<String>) = ff.writeText(gson.toJson(f))
-    fun loadApiKey(): String = prefs.getString("gemini_key_v3", "") ?: ""
-    fun saveApiKey(k: String) = prefs.edit().putString("gemini_key_v3", k.trim()).apply()
+
+    fun loadHashes(): List<HashedCard> = try {
+        if (!hf.exists()) emptyList()
+        else gson.fromJson(hf.readText(), object : TypeToken<List<HashedCard>>() {}.type) ?: emptyList()
+    } catch (_: Exception) { emptyList() }
+
+    fun saveHashes(h: List<HashedCard>) = hf.writeText(gson.toJson(h))
 }
 
 class MainActivity : ComponentActivity() {
@@ -196,7 +287,7 @@ fun PokeCollectorApp() {
     val repo = remember { CollectionRepository(ctx) }
     var cards by remember { mutableStateOf(repo.loadCards()) }
     var folders by remember { mutableStateOf(repo.loadFolders()) }
-    var apiKey by remember { mutableStateOf(repo.loadApiKey()) }
+    var visualDb by remember { mutableStateOf(repo.loadHashes()) }
     var scanFolder by remember { mutableStateOf<String?>(null) }
     var tab by remember { mutableIntStateOf(0) }
 
@@ -231,8 +322,8 @@ fun PokeCollectorApp() {
             if (tab == 0) ScannerScreen(
                 folders = folders,
                 activeFolder = scanFolder,
-                apiKey = apiKey,
-                onSaveApiKey = { apiKey = it; repo.saveApiKey(it); ApiClient.workingModel = null },
+                visualDb = visualDb,
+                onUpdateDb = { newDb -> visualDb = newDb; repo.saveHashes(newDb) },
                 onSelFolder = { scanFolder = it },
                 onNewFolder = ::addF,
                 onAdded = { c, fin -> addC(c, scanFolder, fin) }
@@ -244,7 +335,7 @@ fun PokeCollectorApp() {
     }
 }
 
-fun imageToBase64Jpeg(image: Image, rotationDegrees: Int): String? {
+fun extractCardCropBitmap(image: Image, rotationDegrees: Int): Bitmap? {
     return try {
         val yBuffer = image.planes[0].buffer
         val uBuffer = image.planes[1].buffer
@@ -259,81 +350,97 @@ fun imageToBase64Jpeg(image: Image, rotationDegrees: Int): String? {
 
         val yuvImage = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
         val rawStream = ByteArrayOutputStream()
-        yuvImage.compressToJpeg(Rect(0, 0, image.width, image.height), 82, rawStream)
+        yuvImage.compressToJpeg(Rect(0, 0, image.width, image.height), 85, rawStream)
         val rawBytes = rawStream.toByteArray()
         val bmp = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size) ?: return null
 
-        val maxSide = 768f
-        val scale = minOf(maxSide / bmp.width, maxSide / bmp.height, 1f)
-        val matrix = Matrix().apply {
-            if (rotationDegrees != 0) postRotate(rotationDegrees.toFloat())
-            if (scale < 1f) postScale(scale, scale)
-        }
-        val finalBmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
-        if (finalBmp != bmp) bmp.recycle()
+        val rotated = if (rotationDegrees != 0) {
+            val m = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
+            Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true).also {
+                if (it != bmp) bmp.recycle()
+            }
+        } else bmp
 
-        val out = ByteArrayOutputStream()
-        finalBmp.compress(Bitmap.CompressFormat.JPEG, 80, out)
-        finalBmp.recycle()
-        Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+        // Вырезаем центральную область под рамку карты (пропорция 2.5 : 3.5 = 0.714)
+        val w = rotated.width
+        val h = rotated.height
+        val targetRatio = 2.5f / 3.5f
+        var cropW = (w * 0.62f).toInt()
+        var cropH = (cropW / targetRatio).toInt()
+        if (cropH > h * 0.68f) {
+            cropH = (h * 0.68f).toInt()
+            cropW = (cropH * targetRatio).toInt()
+        }
+        val left = ((w - cropW) / 2).coerceAtLeast(0)
+        val top = ((h - cropH) / 2 + (h * 0.04f).toInt()).coerceIn(0, (h - cropH).coerceAtLeast(0))
+
+        val cropped = Bitmap.createBitmap(rotated, left, top, cropW.coerceAtMost(w - left), cropH.coerceAtMost(h - top))
+        if (cropped != rotated) rotated.recycle()
+        cropped
     } catch (_: Exception) {
         null
     }
 }
 
-suspend fun identifyWithGemini(apiKey: String, base64Jpeg: String): GeminiCardResult? {
-    val cleanKey = apiKey.trim()
-    val prompt = """
-        Analyze this photo of a Pokémon TCG card. Return ONLY valid JSON with fields:
-        - "hasCard": boolean (true if a Pokémon card is clearly visible)
-        - "name": string (exact English Pokémon/Trainer/Energy card name, e.g. "Lampent", "Metapod", "Pikachu")
-        - "number": string (card number without leading zeros, e.g. "17", "2", "TG05")
-        - "total": string (set total after slash without leading zeros, e.g. "86", "165")
-        - "setCode": string (3-letter set code at bottom-left like "WHT", "MEW", "SVI", "PAL", "OBF", "PAR", "PAF", "TEF", "TWM", "SFA", "SCR", "SSP", "PRE", "JTG", "DRI", "BLK", or null if none)
-        - "finish": string ("Reverse" if the text/attack box or card border has reverse holofoil sheen/pattern, "Holo" if only the artwork illustration is holographic foil, otherwise "Normal")
-    """.trimIndent()
-
-    val req = GeminiRequest(
-        contents = listOf(
-            GeminiContent(
-                role = "user",
-                parts = listOf(
-                    GeminiPart(text = prompt),
-                    GeminiPart(inlineData = GeminiInlineData("image/jpeg", base64Jpeg))
-                )
-            )
-        )
-    )
-
-    val models = listOfNotNull(
-        ApiClient.workingModel,
-        "gemini-2.5-flash",
-        "gemini-2.5-flash-lite",
-        "gemini-2.0-flash"
-    ).distinct()
-
-    var resp: GeminiResponse? = null
-    var lastError: Exception? = null
-
-    for (mod in models) {
-        try {
-            resp = ApiClient.gemini.analyzeCard(mod, cleanKey, req)
-            ApiClient.workingModel = mod
-            break
-        } catch (e: HttpException) {
-            lastError = e
-            if (e.code() == 404) continue
-            val errBody = try { e.response()?.errorBody()?.string() } catch (_: Exception) { null }
-            val msg = errBody?.let { Regex("\"message\"\\s*:\\s*\"([^\"]+)\"").find(it)?.groupValues?.get(1) } ?: "HTTP ${e.code()}"
-            throw Exception(msg)
-        }
+suspend fun downloadAndHashSet(
+    setPreset: SetPreset,
+    existingDb: List<HashedCard>,
+    onProgress: (String) -> Unit
+): List<HashedCard> = withContext(Dispatchers.IO) {
+    onProgress("Загружаю список карт ${setPreset.code}...")
+    val allDtos = mutableListOf<PokemonCardDto>()
+    var page = 1
+    while (true) {
+        val resp = ApiClient.api.getCardsBySet("set.id:${setPreset.apiId}", 250, page)
+        allDtos.addAll(resp.data)
+        if (resp.data.size < 250) break
+        page++
     }
 
-    if (resp == null) throw (lastError ?: Exception("Модель не найдена (404)"))
+    val existingIds = existingDb.map { it.id }.toSet()
+    val toDownload = allDtos.filter { !existingIds.contains(it.id) }
+    if (toDownload.isEmpty()) return@withContext existingDb
 
-    val rawText = resp.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text ?: return null
-    val cleaned = rawText.removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
-    return Gson().fromJson(cleaned, GeminiCardResult::class.java)
+    val sem = Semaphore(8)
+    var done = 0
+    val newHashed = coroutineScope {
+        toDownload.map { dto ->
+            async {
+                sem.withPermit {
+                    try {
+                        val req = Request.Builder().url(dto.images.small).build()
+                        ApiClient.okHttp.newCall(req).execute().use { r ->
+                            val bytes = r.body?.bytes()
+                            if (bytes != null) {
+                                val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                                if (bmp != null) {
+                                    val (dHash, colorSig) = VisualMatcher.computeSignature(bmp)
+                                    bmp.recycle()
+                                    done++
+                                    if (done % 15 == 0 || done == toDownload.size) {
+                                        onProgress("${setPreset.code}: $done / ${toDownload.size}")
+                                    }
+                                    return@withPermit HashedCard(
+                                        id = dto.id,
+                                        name = dto.name,
+                                        number = dto.number,
+                                        setId = setPreset.apiId,
+                                        setName = dto.set.name,
+                                        imageUrl = dto.images.small,
+                                        dHash = dHash,
+                                        colorSig = colorSig
+                                    )
+                                }
+                            }
+                        }
+                    } catch (_: Exception) {}
+                    null
+                }
+            }
+        }.awaitAll().filterNotNull()
+    }
+
+    existingDb.filter { it.setId != setPreset.apiId } + existingDb.filter { it.setId == setPreset.apiId } + newHashed
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -341,8 +448,8 @@ suspend fun identifyWithGemini(apiKey: String, base64Jpeg: String): GeminiCardRe
 fun ScannerScreen(
     folders: List<String>,
     activeFolder: String?,
-    apiKey: String,
-    onSaveApiKey: (String) -> Unit,
+    visualDb: List<HashedCard>,
+    onUpdateDb: (List<HashedCard>) -> Unit,
     onSelFolder: (String?) -> Unit,
     onNewFolder: (String) -> Unit,
     onAdded: (PokemonCardDto, String) -> Unit
@@ -352,30 +459,36 @@ fun ScannerScreen(
     val launch = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { perm = it }
     LaunchedEffect(Unit) { if (!perm) launch.launch(Manifest.permission.CAMERA) }
 
-    var status by remember { mutableStateOf(if (apiKey.isBlank()) "Нажмите ⚙️ и вставьте ключ Gemini" else "Gemini AI готов — кладите карту...") }
-    var subInfo by remember { mutableStateOf("") }
+    var status by remember {
+        mutableStateOf(
+            if (visualDb.isEmpty()) "Нажмите [База] справа сверху и скачайте сет"
+            else "Оффлайн-сканер готов (${visualDb.size} карт)"
+        )
+    }
+    var matchInfo by remember { mutableStateOf("") }
     var found by remember { mutableStateOf<PokemonCardDto?>(null) }
-    var busy by remember { mutableStateOf(false) }
     var auto by remember { mutableStateOf(true) }
-    var useGemini by remember { mutableStateOf(apiKey.isNotBlank()) }
-    var finishMode by remember { mutableStateOf(if (apiKey.isNotBlank()) "Авто" else "Normal") }
-    var lastAddedSig by remember { mutableStateOf("") }
-    var lastAddedBox by remember { mutableStateOf<Rect?>(null) }
-    var lastAddTime by remember { mutableLongStateOf(0L) }
+    var finishMode by remember { mutableStateOf("Normal") }
+    var selectedSetFilter by remember { mutableStateOf<String?>(null) }
+    var lastAddedCardId by remember { mutableStateOf("") }
+    var lastMatchedHash by remember { mutableLongStateOf(0L) }
+    var candidateId by remember { mutableStateOf("") }
+    var candidateStreak by remember { mutableIntStateOf(0) }
     var manualTrigger by remember { mutableStateOf(false) }
     var banner by remember { mutableStateOf<String?>(null) }
     var dlg by remember { mutableStateOf(false) }
-    var keyDlg by remember { mutableStateOf(false) }
+    var dbDlg by remember { mutableStateOf(false) }
     var torch by remember { mutableStateOf(false) }
     var extraRot by remember { mutableIntStateOf(0) }
     var camCtrl by remember { mutableStateOf<Camera?>(null) }
 
     val curFolder by rememberUpdatedState(activeFolder)
     val curAuto by rememberUpdatedState(auto)
-    val curUseGemini by rememberUpdatedState(useGemini)
-    val curApiKey by rememberUpdatedState(apiKey)
+    val curDb by rememberUpdatedState(visualDb)
+    val curSetFilter by rememberUpdatedState(selectedSetFilter)
     val curFinishMode by rememberUpdatedState(finishMode)
     val curExtraRot by rememberUpdatedState(extraRot)
+
     val tone = remember { try { ToneGenerator(AudioManager.STREAM_NOTIFICATION, 95) } catch (_: Exception) { null } }
     DisposableEffect(Unit) { onDispose { tone?.release() } }
 
@@ -387,22 +500,19 @@ fun ScannerScreen(
     LaunchedEffect(torch, camCtrl) { try { camCtrl?.cameraControl?.enableTorch(torch) } catch (_: Exception) {} }
     LaunchedEffect(banner) { if (banner != null) { delay(1300); banner = null } }
     if (dlg) FolderDlg({ dlg = false }) { onNewFolder(it); onSelFolder(it.trim()); dlg = false }
-    if (keyDlg) ApiKeyDlg(apiKey, { keyDlg = false }) {
-        val trimmed = it.trim()
-        onSaveApiKey(trimmed)
-        keyDlg = false
-        if (trimmed.isNotEmpty()) {
-            useGemini = true
-            finishMode = "Авто"
-            lastAddedSig = ""
-            lastAddedBox = null
-            status = "Ключ сохранён — Gemini AI готов!"
-        } else {
-            useGemini = false
-            finishMode = "Normal"
-            status = "Режим: Локальный OCR"
-        }
+    if (dbDlg) {
+        VisualDbDialog(
+            visualDb = visualDb,
+            activeSetFilter = selectedSetFilter,
+            onSelectSetFilter = { selectedSetFilter = it },
+            onUpdateDb = { updated ->
+                onUpdateDb(updated)
+                status = "База обновлена (${updated.size} карт)"
+            },
+            onDismiss = { dbDlg = false }
+        )
     }
+
     if (!perm) { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Button({ launch.launch(Manifest.permission.CAMERA) }) { Text("Разрешить камеру") } }; return }
 
     Box(Modifier.fillMaxSize()) {
@@ -412,149 +522,67 @@ fun ScannerScreen(
                     val prov = ProcessCameraProvider.getInstance(c).get()
                     val prev = Preview.Builder().build().apply { setSurfaceProvider(pv.surfaceProvider) }
                     val an = ImageAnalysis.Builder().setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build()
-                    val rec = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
                     var lastT = 0L
                     an.setAnalyzer(Executors.newSingleThreadExecutor()) { px ->
                         val now = System.currentTimeMillis()
-                        if (!manualTrigger && now - lastT < 450) { px.close(); return@setAnalyzer }
+                        if (!manualTrigger && now - lastT < 180) { px.close(); return@setAnalyzer }
                         @androidx.camera.core.ExperimentalGetImage val img = px.image
                         if (img != null) {
                             lastT = now
                             val rot = (px.imageInfo.rotationDegrees + curExtraRot) % 360
-                            val inImg = InputImage.fromMediaImage(img, rot)
+                            val crop = extractCardCropBitmap(img, rot)
+                            if (crop != null) {
+                                val (frameHash, frameColor) = VisualMatcher.computeSignature(crop)
+                                crop.recycle()
 
-                            val jpegB64 = if (curUseGemini && curApiKey.isNotBlank() && !busy) {
-                                imageToBase64Jpeg(img, rot)
-                            } else null
-
-                            rec.process(inImg).addOnSuccessListener { v ->
+                                val db = curDb
                                 val isManual = manualTrigger
-                                val t = System.currentTimeMillis()
-                                val localParsed = parseCardClean(v, allowNameOnly = true)
-
-                                if (localParsed == null) {
-                                    if (!isManual && lastAddedSig.isNotEmpty()) {
-                                        lastAddedSig = ""
-                                        lastAddedBox = null
-                                        if (!busy) status = "Жду следующую карту..."
-                                    }
-                                    if (!isManual) return@addOnSuccessListener
-                                } else {
-                                    val prevBox = lastAddedBox
-                                    val curBox = localParsed.nameBox
-                                    val shifted = if (prevBox != null && curBox != null) {
-                                        abs(prevBox.centerX() - curBox.centerX()) > 40 || abs(prevBox.centerY() - curBox.centerY()) > 40
-                                    } else false
-
-                                    if (!isManual && curAuto && lastAddedSig.isNotEmpty()) {
-                                        if (shifted && t - lastAddTime > 900) {
-                                            lastAddedSig = ""
-                                            lastAddedBox = null
-                                        } else {
-                                            return@addOnSuccessListener
-                                        }
-                                    }
-                                }
-
-                                if (busy) return@addOnSuccessListener
-                                if (!isManual && !curAuto) return@addOnSuccessListener
-
-                                // --- РЕЖИМ GEMINI VISION ---
-                                if (curUseGemini && curApiKey.isNotBlank() && jpegB64 != null) {
-                                    manualTrigger = false
-                                    busy = true
-                                    status = "Gemini распознаёт карту..."
-                                    scope.launch {
-                                        try {
-                                            val gRes = withContext(Dispatchers.IO) { identifyWithGemini(curApiKey, jpegB64) }
-                                            if (gRes != null && gRes.hasCard && !gRes.name.isNullOrBlank()) {
-                                                val gName = gRes.name.trim()
-                                                val gNum = gRes.number?.trim()?.trimStart('0')?.ifEmpty { "0" }
-                                                val gTot = gRes.total?.trim()?.trimStart('0')
-                                                val gCode = gRes.setCode?.uppercase()?.trim()
-                                                val apiSetId = gCode?.let { SET_CODE_MAP[it] }
-
-                                                val queries = mutableListOf<String>()
-                                                if (apiSetId != null && gNum != null) {
-                                                    queries.add("name:\"$gName\" set.id:$apiSetId number:$gNum")
-                                                    queries.add("set.id:$apiSetId number:$gNum")
-                                                }
-                                                if (gNum != null && !gTot.isNullOrEmpty()) queries.add("name:\"$gName\" number:$gNum set.printedTotal:$gTot")
-                                                if (gNum != null) queries.add("name:\"$gName\" number:$gNum")
-                                                queries.add("name:\"$gName\"")
-
-                                                val cacheKey = queries.first()
-                                                subInfo = "AI: ${gCode ?: ""} $gName #${gNum ?: "?"}/${gTot ?: "?"} [${gRes.finish ?: "Normal"}]"
-
-                                                val card = ApiClient.cache[cacheKey] ?: withContext(Dispatchers.IO) {
-                                                    queries.firstNotNullOfOrNull { q -> ApiClient.api.searchCards(q).data.firstOrNull() }?.also { ApiClient.cache[cacheKey] = it }
-                                                }
-
-                                                if (card != null) {
-                                                    val aiFin = when (gRes.finish?.lowercase()) {
-                                                        "reverse" -> "Reverse"
-                                                        "holo" -> "Holo"
-                                                        else -> "Normal"
-                                                    }
-                                                    val finalFin = if (curFinishMode == "Авто") aiFin else curFinishMode
-                                                    val sig = "${card.id}::$finalFin"
-                                                    found = card
-                                                    if (isManual || (curAuto && sig != lastAddedSig)) {
-                                                        lastAddedSig = sig
-                                                        lastAddedBox = localParsed?.nameBox
-                                                        lastAddTime = System.currentTimeMillis()
-                                                        onAdded(card, finalFin); beepAndVib()
-                                                        status = "Готово: ${card.name} [$finalFin]"
-                                                        banner = "+1 ${card.name} [$finalFin] → ${curFolder ?: card.set.name}"
-                                                    }
-                                                } else {
-                                                    status = "Не найдено в базе: $gName #${gNum ?: ""}"
-                                                }
-                                            } else {
-                                                status = if (isManual) "Gemini не увидел карту" else "Жду карту..."
-                                            }
-                                        } catch (e: Exception) {
-                                            status = "Gemini: ${e.message?.take(42) ?: "ошибка сети"}"
-                                        } finally {
-                                            busy = false
-                                        }
-                                    }
-                                    return@addOnSuccessListener
-                                }
-
-                                // --- ЛОКАЛЬНЫЙ OCR ---
-                                val p = parseCardClean(v, allowNameOnly = isManual) ?: run {
-                                    if (isManual) { manualTrigger = false; status = "OCR: не вижу имя/номер" }
-                                    return@addOnSuccessListener
-                                }
-                                val key = p.queries.firstOrNull() ?: return@addOnSuccessListener
                                 manualTrigger = false
-                                busy = true
-                                status = "OCR: ${p.displayLabel}"
-                                scope.launch {
-                                    try {
-                                        val card = ApiClient.cache[key] ?: withContext(Dispatchers.IO) {
-                                            p.queries.firstNotNullOfOrNull { q -> ApiClient.api.searchCards(q).data.firstOrNull() }?.also { ApiClient.cache[key] = it }
+
+                                if (db.isEmpty()) {
+                                    if (isManual) status = "Сначала скачайте сет в [База]"
+                                } else {
+                                    val match = VisualMatcher.findBestMatch(frameHash, frameColor, db, curSetFilter)
+                                    if (match == null) {
+                                        candidateId = ""
+                                        candidateStreak = 0
+                                        // Если карту убрали из рамки — снимаем блокировку дубля
+                                        if (lastAddedCardId.isNotEmpty() && java.lang.Long.bitCount(frameHash xor lastMatchedHash) > 18) {
+                                            lastAddedCardId = ""
+                                            status = "Жду следующую карту..."
+                                        } else if (isManual) {
+                                            status = "Карта не узнана — выровняйте в рамке"
                                         }
-                                        if (card != null) {
-                                            val finalFin = if (curFinishMode == "Авто") "Normal" else curFinishMode
-                                            val sig = "${card.id}::$finalFin"
-                                            found = card
-                                            if (isManual || (curAuto && p.hasExactNumber && sig != lastAddedSig)) {
-                                                lastAddedSig = sig
-                                                lastAddedBox = p.nameBox
-                                                lastAddTime = System.currentTimeMillis()
-                                                onAdded(card, finalFin); beepAndVib()
-                                                status = "Готово: ${card.name} [$finalFin]"
-                                                banner = "+1 ${card.name} [$finalFin] → ${curFolder ?: card.set.name}"
+                                    } else {
+                                        val (card, score) = match
+                                        matchInfo = "${card.name} (${card.setName} #${card.number}) • точность ${100 - (score / 10).coerceIn(1, 95)}%"
+
+                                        if (card.id == candidateId) {
+                                            candidateStreak++
+                                        } else {
+                                            candidateId = card.id
+                                            candidateStreak = 1
+                                        }
+
+                                        // 2 кадра подряд для защиты от случайного смаза при движении руки
+                                        if (isManual || (curAuto && candidateStreak >= 2 && card.id != lastAddedCardId)) {
+                                            lastAddedCardId = card.id
+                                            lastMatchedHash = frameHash
+                                            val fin = curFinishMode
+                                            val dto = card.toDto()
+                                            scope.launch(Dispatchers.Main) {
+                                                found = dto
+                                                onAdded(dto, fin)
+                                                beepAndVib()
+                                                status = "Готово: ${card.name} [$fin]"
+                                                banner = "+1 ${card.name} [$fin] → ${curFolder ?: card.setName}"
                                             }
-                                        } else status = "Нет в базе: ${p.displayLabel}"
-                                    } catch (e: Exception) {
-                                        status = "Сеть: ${e.message?.take(30) ?: "ошибка"}"
-                                    } finally { busy = false }
+                                        }
+                                    }
                                 }
-                            }.addOnCompleteListener { px.close() }
-                        } else px.close()
+                            }
+                        }
+                        px.close()
                     }
                     try {
                         prov.unbindAll()
@@ -564,46 +592,57 @@ fun ScannerScreen(
             }
         }, modifier = Modifier.fillMaxSize())
 
+        // Визуальная рамка для позиционирования карты (пропорция 2.5 x 3.5)
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val targetRatio = 2.5f / 3.5f
+            var boxW = size.width * 0.64f
+            var boxH = boxW / targetRatio
+            if (boxH > size.height * 0.56f) {
+                boxH = size.height * 0.56f
+                boxW = boxH * targetRatio
+            }
+            val left = (size.width - boxW) / 2f
+            val top = (size.height - boxH) / 2f + size.height * 0.04f
+
+            drawRoundRect(
+                color = if (lastAddedCardId.isNotEmpty()) Color(0xFF4CAF50) else Color.White.copy(alpha = 0.85f),
+                topLeft = Offset(left, top),
+                size = Size(boxW, boxH),
+                cornerRadius = CornerRadius(24f, 24f),
+                style = Stroke(width = 6f)
+            )
+        }
+
         Column(Modifier.align(Alignment.TopCenter).fillMaxWidth().padding(12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
             Surface(color = Color.Black.copy(0.84f), shape = RoundedCornerShape(16.dp)) {
                 Column(Modifier.padding(12.dp, 8.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
                             Text(status, color = Color.White, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            if (subInfo.isNotEmpty() && useGemini) {
-                                Text(subInfo, color = Color(0xFF81D4FA), fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            if (matchInfo.isNotEmpty()) {
+                                Text(matchInfo, color = Color(0xFF81D4FA), fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             }
                         }
-                        IconButton({ keyDlg = true }, Modifier.size(32.dp)) {
-                            Icon(Icons.Default.Settings, null, tint = if (apiKey.isBlank()) Color(0xFFFFD54F) else Color.White, modifier = Modifier.size(18.dp))
+                        FilledTonalButton(
+                            onClick = { dbDlg = true },
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                            modifier = Modifier.height(30.dp)
+                        ) {
+                            Icon(Icons.Default.Download, null, modifier = Modifier.size(15.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("База (${visualDb.size})", fontSize = 11.sp, fontWeight = FontWeight.Bold)
                         }
                         IconButton({ torch = !torch }, Modifier.size(32.dp)) {
                             Icon(if (torch) Icons.Default.FlashOn else Icons.Default.FlashOff, null, tint = if (torch) Color(0xFFFFD54F) else Color.White, modifier = Modifier.size(18.dp))
                         }
-                        IconButton({ extraRot = (extraRot + 90) % 360; lastAddedSig = ""; lastAddedBox = null; status = "Поворот: $extraRot°" }, Modifier.size(32.dp)) {
+                        IconButton({ extraRot = (extraRot + 90) % 360; lastAddedCardId = ""; status = "Поворот: $extraRot°" }, Modifier.size(32.dp)) {
                             Icon(Icons.Default.RotateRight, null, tint = Color.White, modifier = Modifier.size(18.dp))
                         }
-                        Switch(auto, { auto = it; if (!it) { lastAddedSig = ""; lastAddedBox = null } })
+                        Switch(auto, { auto = it; if (!it) lastAddedCardId = "" })
                     }
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        item {
-                            FilterChip(
-                                selected = useGemini,
-                                onClick = {
-                                    if (!useGemini && apiKey.isBlank()) {
-                                        keyDlg = true
-                                    } else {
-                                        useGemini = !useGemini
-                                        lastAddedSig = ""
-                                        lastAddedBox = null
-                                        status = if (useGemini) "Режим: Gemini AI" else "Режим: Локальный OCR"
-                                    }
-                                },
-                                label = { Text(if (useGemini) "✨ Gemini AI" else "📷 OCR", fontSize = 11.sp, fontWeight = FontWeight.Bold) }
-                            )
-                        }
-                        items(listOf("Авто", "Normal", "Reverse", "Holo")) { m ->
-                            FilterChip(finishMode == m, { finishMode = m }, { Text(if (m == "Авто") "Фольга: AI" else m, fontSize = 11.sp) })
+                        items(listOf("Normal", "Reverse", "Holo")) { m ->
+                            FilterChip(finishMode == m, { finishMode = m }, { Text(m, fontSize = 11.sp) })
                         }
                     }
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -621,18 +660,17 @@ fun ScannerScreen(
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             found?.let { c ->
-                val finLabel = if (finishMode == "Авто") (subInfo.substringAfterLast("[").substringBefore("]").ifEmpty { "Normal" }) else finishMode
                 Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)) {
                     Row(Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
                         AsyncImage(c.images.small, c.name, Modifier.size(60.dp, 84.dp).clip(RoundedCornerShape(8.dp)))
                         Spacer(Modifier.width(10.dp))
                         Column(Modifier.weight(1f)) {
-                            Text("${c.name} [$finLabel]", fontWeight = FontWeight.Bold, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text("${c.name} [$finishMode]", fontWeight = FontWeight.Bold, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             Text("${activeFolder ?: c.set.name} • #${c.number}", fontSize = 12.sp, color = Color.Gray, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             Spacer(Modifier.height(6.dp))
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Button({ onAdded(c, finLabel); beepAndVib(); banner = "+1 ${c.name} [$finLabel]" }, Modifier.weight(1f)) { Text("+1", fontSize = 12.sp) }
-                                OutlinedButton({ found = null; lastAddedSig = ""; lastAddedBox = null; status = "Жду карту..." }) { Text("Сброс", fontSize = 12.sp) }
+                                Button({ onAdded(c, finishMode); beepAndVib(); banner = "+1 ${c.name} [$finishMode]" }, Modifier.weight(1f)) { Text("+1", fontSize = 12.sp) }
+                                OutlinedButton({ found = null; lastAddedCardId = ""; candidateStreak = 0; status = "Жду карту..." }) { Text("Сброс", fontSize = 12.sp) }
                             }
                         }
                     }
@@ -641,10 +679,9 @@ fun ScannerScreen(
             }
             FilledTonalButton(
                 onClick = {
-                    lastAddedSig = ""
-                    lastAddedBox = null
+                    lastAddedCardId = ""
+                    candidateStreak = 0
                     manualTrigger = true
-                    status = "Ручной снимок..."
                 },
                 shape = CircleShape,
                 colors = ButtonDefaults.filledTonalButtonColors(
@@ -661,115 +698,94 @@ fun ScannerScreen(
 }
 
 @Composable
-fun ApiKeyDlg(currentKey: String, onDim: () -> Unit, onSave: (String) -> Unit) {
-    var k by remember { mutableStateOf(currentKey) }
+fun VisualDbDialog(
+    visualDb: List<HashedCard>,
+    activeSetFilter: String?,
+    onSelectSetFilter: (String?) -> Unit,
+    onUpdateDb: (List<HashedCard>) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val scope = rememberCoroutineScope()
+    var downloadingCode by remember { mutableStateOf<String?>(null) }
+    var progressText by remember { mutableStateOf("") }
+
     AlertDialog(
-        onDismissRequest = onDim,
-        title = { Text("Gemini API Key") },
-        text = {
-            OutlinedTextField(
-                value = k,
-                onValueChange = { k = it },
-                placeholder = { Text("Вставьте ключ из Google AI Studio...") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth()
-            )
+        onDismissRequest = { if (downloadingCode == null) onDismiss() },
+        title = {
+            Column {
+                Text("Оффлайн-база карт (${visualDb.size})")
+                if (progressText.isNotEmpty()) {
+                    Text(progressText, fontSize = 12.sp, color = Color(0xFF81D4FA))
+                }
+            }
         },
-        confirmButton = { Button({ onSave(k) }) { Text("Сохранить") } },
-        dismissButton = { TextButton(onDim) { Text("Отмена") } }
+        text = {
+            Column(Modifier.heightIn(max = 380.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    FilterChip(
+                        selected = activeSetFilter == null,
+                        onClick = { onSelectSetFilter(null) },
+                        label = { Text("Искать по всем (${visualDb.size})", fontSize = 11.sp) }
+                    )
+                }
+                Spacer(Modifier.height(6.dp))
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    items(AVAILABLE_SETS) { preset ->
+                        val countInDb = visualDb.count { it.setId == preset.apiId }
+                        val isCurrentFilter = activeSetFilter == preset.apiId
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(if (isCurrentFilter) Color(0xFF1E3A5F) else Color.White.copy(0.05f))
+                                .clickable { if (countInDb > 0) onSelectSetFilter(if (isCurrentFilter) null else preset.apiId) }
+                                .padding(horizontal = 10.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(preset.title, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                                Text(
+                                    if (countInDb > 0) "Скачано: $countInDb карт" + (if (isCurrentFilter) " • Активный фильтр" else "") else "Не загружен",
+                                    fontSize = 11.sp,
+                                    color = if (countInDb > 0) Color(0xFF81C784) else Color.Gray
+                                )
+                            }
+                            if (downloadingCode == preset.code) {
+                                CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
+                            } else {
+                                TextButton(
+                                    onClick = {
+                                        downloadingCode = preset.code
+                                        progressText = "Подключение к pokemontcg.io..."
+                                        scope.launch {
+                                            try {
+                                                val updated = downloadAndHashSet(preset, visualDb) { progressText = it }
+                                                onUpdateDb(updated)
+                                                onSelectSetFilter(preset.apiId)
+                                                progressText = "Готово: ${preset.title}"
+                                            } catch (e: Exception) {
+                                                progressText = "Ошибка сети: ${e.message?.take(30) ?: "сбой"}"
+                                            } finally {
+                                                downloadingCode = null
+                                            }
+                                        }
+                                    },
+                                    enabled = downloadingCode == null
+                                ) {
+                                    Text(if (countInDb > 0) "Обновить" else "Скачать", fontSize = 12.sp)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss, enabled = downloadingCode == null) {
+                Text("Закрыть")
+            }
+        }
     )
-}
-
-fun fixOcrDigits(s: String): String = s.map {
-    when (it) {
-        'o', 'O', 'Q', 'D' -> '0'
-        'I', 'l', '|' -> '1'
-        'Z', 'z' -> '2'
-        'S', 's' -> '5'
-        'G' -> '6'
-        'B' -> '8'
-        else -> it
-    }
-}.joinToString("")
-
-fun parseCardClean(vt: Text, allowNameOnly: Boolean = false): ParsedCardInfo? {
-    val raw = vt.text; if (raw.isBlank()) return null
-    var num: String? = null
-    var total: String? = null
-    var setCode: String? = null
-
-    val slashMatch = Regex("""\b([A-Za-z0-9|]{1,5})\s*/\s*([A-Za-z0-9|]{2,4})\b""").find(raw)
-    if (slashMatch != null) {
-        val leftRaw = slashMatch.groupValues[1]
-        val rightFixed = fixOcrDigits(slashMatch.groupValues[2])
-        val prefix = Regex("""^(TG|GG|SV|SWSH|SM|XY|BW|RC|SH)\d+""", RegexOption.IGNORE_CASE).find(leftRaw)
-        num = if (prefix != null) {
-            val p = leftRaw.takeWhile { it.isLetter() }.uppercase()
-            val d = fixOcrDigits(leftRaw.drop(p.length)).trimStart('0').ifEmpty { "0" }
-            "$p$d"
-        } else {
-            fixOcrDigits(leftRaw).filter { it.isDigit() }.trimStart('0').ifEmpty { "0" }
-        }
-        val totDigits = rightFixed.filter { it.isDigit() }.trimStart('0')
-        if (totDigits.isNotEmpty() && totDigits.toIntOrNull() in 10..400) total = totDigits
-    }
-
-    val allUpperTokens = Regex("""\b([A-Z0-9]{3})\b""").findAll(raw.uppercase()).map { it.groupValues[1] }.toList()
-    for (cand in allUpperTokens.asReversed()) {
-        val fixedCode = cand.replace('0', 'O').replace('1', 'I').replace('5', 'S').replace('8', 'B')
-        if (SET_CODE_MAP.containsKey(fixedCode)) {
-            setCode = fixedCode
-            break
-        }
-    }
-
-    val lines = vt.textBlocks.sortedBy { it.boundingBox?.top ?: Int.MAX_VALUE }.flatMap { it.lines }.sortedBy { it.boundingBox?.top ?: Int.MAX_VALUE }
-    val badPrefix = Regex("""^(STAGE\s*\d*|STAG\w*|GTAG\w*|BASIC|BASI\w*|VMAX|VSTAR|TRAINER|SUPPORTER|ITEM|STADIUM|ENERGY)\s+""", RegexOption.IGNORE_CASE)
-    val noise = setOf("BASIC", "STAGE", "STAGE 1", "STAGE 2", "VMAX", "VSTAR", "TRAINER", "SUPPORTER", "ITEM", "STADIUM", "ENERGY", "WEAKNESS", "RESISTANCE", "RETREAT")
-    var name: String? = null
-    var nameBox: Rect? = null
-    for (l in lines.take(10)) {
-        var t = l.text.trim()
-            .replace(badPrefix, "")
-            .replace(Regex("""\bHP\s*\d+\b|\b\d+\s*HP\b""", RegexOption.IGNORE_CASE), "")
-            .replace(Regex("""[^a-zA-Z0-9\s.'-]"""), "")
-            .trim()
-        t = t.replace(Regex("""(?<=[a-zA-Z]{3})\d{2,3}$"""), "").trim()
-        val w = t.split(Regex("""\s+""")).toMutableList()
-        while (w.size >= 2 && w[0].length in 2..6 && w[0].count { it.isUpperCase() } >= 2 && w[1][0].isUpperCase() && w[1].drop(1).any { it.isLowerCase() }) {
-            w.removeAt(0)
-        }
-        t = w.joinToString(" ")
-        val u = t.uppercase()
-        if (t.length in 3..26 && !noise.contains(u) && !u.startsWith("EVOLVES") && !u.startsWith("STAG") && !u.startsWith("GTAG") && t.any { it.isLetter() }) {
-            name = t
-            nameBox = l.boundingBox
-            break
-        }
-    }
-
-    val n = name ?: return null
-    val apiSetId = setCode?.let { SET_CODE_MAP[it] }
-    val qs = mutableListOf<String>()
-
-    if (apiSetId != null && num != null) {
-        qs.add("name:\"$n\" set.id:$apiSetId number:$num")
-        qs.add("set.id:$apiSetId number:$num")
-    }
-    if (num != null && total != null) qs.add("name:\"$n\" number:$num set.printedTotal:$total")
-    if (num != null) qs.add("name:\"$n\" number:$num")
-    if (qs.isEmpty()) {
-        if (!allowNameOnly) return null
-        qs.add("name:\"$n\"")
-    }
-
-    val label = buildString {
-        if (setCode != null) append("$setCode ")
-        append("$n ")
-        if (num != null) append("#$num" + (total?.let { "/$it" } ?: ""))
-    }.trim()
-
-    return ParsedCardInfo(n, qs, label, num != null, nameBox)
 }
 
 @Composable
