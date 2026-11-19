@@ -16,6 +16,7 @@ android {
 
     defaultConfig {
         minSdk = 26
+        targetSdk = 35
         namespace = APP_ID
 
         applicationId = APP_ID
