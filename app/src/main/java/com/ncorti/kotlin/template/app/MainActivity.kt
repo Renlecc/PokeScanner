@@ -68,7 +68,7 @@ data class PokemonCardDto(val id: String, val name: String, val number: String, 
 data class CardSetDto(val name: String)
 data class CardImagesDto(val small: String, val large: String)
 data class CollectedCard(val id: String, val name: String, val number: String, val setName: String, val imageUrl: String, val count: Int)
-data class ParsedCardInfo(val primaryQuery: String, val fallbackQuery: String?, val displayLabel: String, val hasExactNumber: Boolean)
+data class ParsedCardInfo(val queries: List<String>, val displayLabel: String, val hasExactNumber: Boolean)
 
 interface PokemonTcgApi {
     @GET("v2/cards")
@@ -174,15 +174,16 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
                             lastT = now
                             rec.process(InputImage.fromMediaImage(img, px.imageInfo.rotationDegrees)).addOnSuccessListener { v ->
                                 val p = parseCardClean(v); val t = System.currentTimeMillis()
-                                if (p != null && !busy && (p.primaryQuery != lastQ || t - lastQT > 2000)) {
-                                    lastQ = p.primaryQuery; lastQT = t; status = "Ищу: ${p.displayLabel}"; busy = true
+                                val key = p?.queries?.firstOrNull() ?: ""
+                                if (p != null && !busy && (key != lastQ || t - lastQT > 2000)) {
+                                    lastQ = key; lastQT = t; status = "Ищу: ${p.displayLabel}"; busy = true
                                     scope.launch {
                                         try {
-                                            val card = ApiClient.cache[p.primaryQuery] ?: withContext(Dispatchers.IO) {
-                                                (ApiClient.api.searchCards(p.primaryQuery).data.firstOrNull() ?: p.fallbackQuery?.let { ApiClient.api.searchCards(it).data.firstOrNull() })?.also { ApiClient.cache[p.primaryQuery] = it }
+                                            val card = ApiClient.cache[key] ?: withContext(Dispatchers.IO) {
+                                                p.queries.firstNotNullOfOrNull { q -> ApiClient.api.searchCards(q).data.firstOrNull() }?.also { ApiClient.cache[key] = it }
                                             }
                                             if (card != null) {
-                                                found = card; status = "Найдено: ${card.name} (#${card.number})"
+                                                found = card; status = "Найдено: ${card.name} (${card.set.name} #${card.number})"
                                                 if (curAuto && p.hasExactNumber && (card.id != lastId || System.currentTimeMillis() - lastAddT > 1500)) {
                                                     lastId = card.id; lastAddT = System.currentTimeMillis(); onAdded(card); vib(); banner = "+1 ${card.name} → ${curFolder ?: card.set.name}"
                                                 }
@@ -236,22 +237,67 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
     }
 }
 
+fun fixOcrDigits(s: String): String = s.map {
+    when (it) {
+        'o', 'O', 'Q', 'D' -> '0'
+        'I', 'l', '|' -> '1'
+        'Z', 'z' -> '2'
+        'S', 's' -> '5'
+        'G' -> '6'
+        'B' -> '8'
+        else -> it
+    }
+}.joinToString("")
+
 fun parseCardClean(vt: Text): ParsedCardInfo? {
     val raw = vt.text; if (raw.isBlank()) return null
-    val num = Regex("""\b([A-Za-z]{0,3}\d{1,3})\s*/\s*[A-Za-z]{0,3}\d{1,3}\b""").find(raw)?.groupValues?.get(1)?.let { if (it.all { c -> c.isDigit() }) it.trimStart('0').ifEmpty { "0" } else it }
+    var num: String? = null
+    var total: String? = null
+
+    val slashMatch = Regex("""\b([A-Za-z0-9|]{1,5})\s*/\s*([A-Za-z0-9|]{2,4})\b""").find(raw)
+    if (slashMatch != null) {
+        val leftRaw = slashMatch.groupValues[1]
+        val rightFixed = fixOcrDigits(slashMatch.groupValues[2])
+        val prefix = Regex("""^(TG|GG|SV|SWSH|SM|XY|BW|RC|SH)\d+""", RegexOption.IGNORE_CASE).find(leftRaw)
+        num = if (prefix != null) {
+            val p = leftRaw.takeWhile { it.isLetter() }.uppercase()
+            val d = fixOcrDigits(leftRaw.drop(p.length)).trimStart('0').ifEmpty { "0" }
+            "$p$d"
+        } else {
+            fixOcrDigits(leftRaw).filter { it.isDigit() }.trimStart('0').ifEmpty { "0" }
+        }
+        val totDigits = rightFixed.filter { it.isDigit() }.trimStart('0')
+        if (totDigits.isNotEmpty() && totDigits.toIntOrNull() in 10..400) total = totDigits
+    }
+
     val lines = vt.textBlocks.sortedBy { it.boundingBox?.top ?: Int.MAX_VALUE }.flatMap { it.lines }.sortedBy { it.boundingBox?.top ?: Int.MAX_VALUE }
-    val bad = Regex("""^(STAGE\s*\d*|STAG\w*|GTAG\w*|BASIC|BASI\w*|VMAX|VSTAR|TRAINER|SUPPORTER|ITEM|STADIUM|ENERGY)\s+""", RegexOption.IGNORE_CASE)
+    val badPrefix = Regex("""^(STAGE\s*\d*|STAG\w*|GTAG\w*|BASIC|BASI\w*|VMAX|VSTAR|TRAINER|SUPPORTER|ITEM|STADIUM|ENERGY)\s+""", RegexOption.IGNORE_CASE)
     val noise = setOf("BASIC", "STAGE", "STAGE 1", "STAGE 2", "VMAX", "VSTAR", "TRAINER", "SUPPORTER", "ITEM", "STADIUM", "ENERGY")
     var name: String? = null
     for (l in lines.take(8)) {
-        var t = l.text.trim().replace(bad, "").replace(Regex("""\bHP\s*\d+\b|\b\d+\s*HP\b""", RegexOption.IGNORE_CASE), "").replace(Regex("""[^a-zA-Z0-9\s.'-]"""), "").trim()
-        val w = t.split(Regex("""\s+"""))
-        if (w.size >= 2 && w[0].length in 4..6 && w[0].all { it.isUpperCase() } && w[1][0].isUpperCase() && w[1].drop(1).any { it.isLowerCase() }) t = w.drop(1).joinToString(" ")
+        var t = l.text.trim()
+            .replace(badPrefix, "")
+            .replace(Regex("""\bHP\s*\d+\b|\b\d+\s*HP\b""", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""[^a-zA-Z0-9\s.'-]"""), "")
+            .trim()
+        val w = t.split(Regex("""\s+""")).toMutableList()
+        while (w.size >= 2 && w[0].length in 2..6 && w[0].count { it.isUpperCase() } >= 2 && w[1][0].isUpperCase() && w[1].drop(1).any { it.isLowerCase() }) {
+            w.removeAt(0)
+        }
+        t = w.joinToString(" ")
         val u = t.uppercase()
-        if (t.length in 3..26 && !noise.contains(u) && !u.startsWith("EVOLVES") && !u.startsWith("STAG") && !u.startsWith("GTAG") && t.any { it.isLetter() }) { name = t; break }
+        if (t.length in 3..26 && !noise.contains(u) && !u.startsWith("EVOLVES") && !u.startsWith("STAG") && !u.startsWith("GTAG") && t.any { it.isLetter() }) {
+            name = t
+            break
+        }
     }
     val n = name ?: return null
-    return if (num != null) ParsedCardInfo("name:\"$n\" number:$num", "name:\"$n\"", "$n #$num", true) else ParsedCardInfo("name:\"$n\"", null, n, false)
+    val qs = mutableListOf<String>()
+    if (num != null && total != null) qs.add("name:\"$n\" number:$num set.printedTotal:$total")
+    if (num != null) qs.add("name:\"$n\" number:$num")
+    qs.add("name:\"$n\"")
+    val label = if (num != null) "$n #$num" + (total?.let { "/$it" } ?: "") else n
+    return ParsedCardInfo(qs, label, num != null)
 }
 
 @Composable
