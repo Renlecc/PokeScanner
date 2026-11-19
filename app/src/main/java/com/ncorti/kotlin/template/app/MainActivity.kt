@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Rect
 import android.media.AudioManager
+import android.media.Image
 import android.media.ToneGenerator
 import android.os.Build
 import android.os.Bundle
@@ -69,15 +70,15 @@ import java.util.concurrent.Executors
 import kotlin.math.abs
 
 data class ApiResponse(val data: List<PokemonCardDto>)
-data class PokemonCardDto(val id: String, val name: String, val number: String, val set: CardSetDto, val images: CardImagesDto)
+data class PokemonCardDto(val id: String, val name: String, val number: String, val rarity: String?, val set: CardSetDto, val images: CardImagesDto)
 data class CardSetDto(val name: String)
 data class CardImagesDto(val small: String, val large: String)
-data class CollectedCard(val id: String, val name: String, val number: String, val setName: String, val imageUrl: String, val count: Int)
+data class CollectedCard(val id: String, val name: String, val number: String, val setName: String, val imageUrl: String, val count: Int, val finish: String? = "Normal")
 data class ParsedCardInfo(val name: String, val queries: List<String>, val displayLabel: String, val hasExactNumber: Boolean, val nameBox: Rect?)
 
 interface PokemonTcgApi {
     @GET("v2/cards")
-    suspend fun searchCards(@Query("q") q: String, @Query("pageSize") ps: Int = 1, @Query("select") s: String = "id,name,number,set,images"): ApiResponse
+    suspend fun searchCards(@Query("q") q: String, @Query("pageSize") ps: Int = 1, @Query("select") s: String = "id,name,number,rarity,set,images"): ApiResponse
 }
 
 object ApiClient {
@@ -115,14 +116,22 @@ fun PokeCollectorApp() {
     fun upd(l: List<CollectedCard>) { cards = l; repo.saveCards(l) }
     fun addF(n: String) { val c = n.trim(); if (c.isNotEmpty() && !folders.contains(c)) { folders = folders + c; repo.saveFolders(folders) } }
     fun delF(n: String) { folders = folders.filter { it != n }; repo.saveFolders(folders); if (scanFolder == n) scanFolder = null }
-    fun addC(c: PokemonCardDto, tf: String?) {
-        val set = tf ?: c.set.name; val eid = "${c.id}::$set"; val ex = cards.find { it.id == eid }
-        upd(if (ex != null) cards.map { if (it.id == eid) it.copy(count = it.count + 1) else it } else listOf(CollectedCard(eid, c.name, c.number, set, c.images.small, 1)) + cards)
+    fun addC(c: PokemonCardDto, tf: String?, finish: String) {
+        val set = tf ?: c.set.name; val eid = "${c.id}::$set::$finish"; val ex = cards.find { it.id == eid }
+        upd(if (ex != null) cards.map { if (it.id == eid) it.copy(count = it.count + 1) else it } else listOf(CollectedCard(eid, c.name, c.number, set, c.images.small, 1, finish)) + cards)
     }
     fun movC(cid: String, nf: String) {
         val t = cards.find { it.id == cid } ?: return; if (t.setName == nf) return
-        val nid = "${t.id.substringBefore("::")}::$nf"; val ex = cards.find { it.id == nid }
+        val fin = t.finish ?: "Normal"
+        val nid = "${t.id.substringBefore("::")}::$nf::$fin"; val ex = cards.find { it.id == nid }
         upd(if (ex != null) cards.filter { it.id != cid }.map { if (it.id == nid) it.copy(count = it.count + t.count) else it } else cards.map { if (it.id == cid) it.copy(id = nid, setName = nf) else it })
+    }
+    fun chgFin(cid: String) {
+        val t = cards.find { it.id == cid } ?: return
+        val order = listOf("Normal", "Reverse", "Holo")
+        val nextFin = order[(order.indexOf(t.finish ?: "Normal") + 1) % order.size]
+        val nid = "${t.id.substringBefore("::")}::${t.setName}::$nextFin"; val ex = cards.find { it.id == nid }
+        upd(if (ex != null) cards.filter { it.id != cid }.map { if (it.id == nid) it.copy(count = it.count + t.count) else it } else cards.map { if (it.id == cid) it.copy(id = nid, finish = nextFin) else it })
     }
 
     Scaffold(bottomBar = {
@@ -132,17 +141,40 @@ fun PokeCollectorApp() {
         }
     }) { p ->
         Box(Modifier.padding(p).fillMaxSize()) {
-            if (tab == 0) ScannerScreen(folders, scanFolder, { scanFolder = it }, ::addF) { addC(it, scanFolder) }
-            else CollectionScreen(cards, folders, ::addF, ::delF, ::movC,
+            if (tab == 0) ScannerScreen(folders, scanFolder, { scanFolder = it }, ::addF) { c, fin -> addC(c, scanFolder, fin) }
+            else CollectionScreen(cards, folders, ::addF, ::delF, ::movC, ::chgFin,
                 { id -> upd(cards.map { if (it.id == id) it.copy(count = it.count + 1) else it }) },
                 { id -> upd(cards.mapNotNull { if (it.id != id) it else if (it.count > 1) it.copy(count = it.count - 1) else null }) })
         }
     }
 }
 
+fun detectFoilGlare(img: Image): Float {
+    return try {
+        val plane = img.planes[0]
+        val buf = plane.buffer
+        val rowStride = plane.rowStride
+        val w = img.width; val h = img.height
+        var sum = 0L; var bright = 0; var samples = 0
+        for (y in (h / 4) until (h * 3 / 4) step 8) {
+            val rowOffset = y * rowStride
+            for (x in (w / 4) until (w * 3 / 4) step 8) {
+                val idx = rowOffset + x
+                if (idx < buf.limit()) {
+                    val v = buf.get(idx).toInt() and 0xFF
+                    sum += v
+                    if (v > 215) bright++
+                    samples++
+                }
+            }
+        }
+        if (samples == 0) 0f else (bright.toFloat() / samples)
+    } catch (_: Exception) { 0f }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (String?) -> Unit, onNewFolder: (String) -> Unit, onAdded: (PokemonCardDto) -> Unit) {
+fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (String?) -> Unit, onNewFolder: (String) -> Unit, onAdded: (PokemonCardDto, String) -> Unit) {
     val ctx = LocalContext.current; val owner = LocalLifecycleOwner.current; val scope = rememberCoroutineScope()
     var perm by remember { mutableStateOf(ContextCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) }
     val launch = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { perm = it }
@@ -150,9 +182,11 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
 
     var status by remember { mutableStateOf("Бросайте карту...") }
     var found by remember { mutableStateOf<PokemonCardDto?>(null) }
+    var foundFinish by remember { mutableStateOf("Normal") }
     var busy by remember { mutableStateOf(false) }
     var lastQ by remember { mutableStateOf("") }; var lastQT by remember { mutableLongStateOf(0L) }
     var auto by remember { mutableStateOf(true) }
+    var finishMode by remember { mutableStateOf("Авто") } // Авто, Normal, Reverse, Holo
     var lastAddedId by remember { mutableStateOf("") }
     var lastAddedName by remember { mutableStateOf("") }
     var lastAddedBox by remember { mutableStateOf<Rect?>(null) }
@@ -166,6 +200,7 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
 
     val curFolder by rememberUpdatedState(activeFolder)
     val curAuto by rememberUpdatedState(auto)
+    val curFinishMode by rememberUpdatedState(finishMode)
     val curExtraRot by rememberUpdatedState(extraRot)
     val tone = remember { try { ToneGenerator(AudioManager.STREAM_NOTIFICATION, 95) } catch (_: Exception) { null } }
     DisposableEffect(Unit) { onDispose { tone?.release() } }
@@ -195,6 +230,7 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
                         @androidx.camera.core.ExperimentalGetImage val img = px.image
                         if (img != null) {
                             lastT = now
+                            val glareRatio = detectFoilGlare(img)
                             val rot = (px.imageInfo.rotationDegrees + curExtraRot) % 360
                             val inImg = InputImage.fromMediaImage(img, rot)
                             rec.process(inImg).addOnSuccessListener { v ->
@@ -230,6 +266,12 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
                                     }
                                 }
 
+                                // В авторежиме без распознанного номера не ищем, чтобы не подставлять левый сет
+                                if (!isManual && curAuto && !p.hasExactNumber) {
+                                    status = "Блик на номере (${p.name}) — жду чёткий кадр..."
+                                    return@addOnSuccessListener
+                                }
+
                                 val key = p.queries.firstOrNull() ?: return@addOnSuccessListener
                                 if (!busy && (isManual || key != lastQ || t - lastQT > 1800)) {
                                     manualTrigger = false
@@ -240,17 +282,27 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
                                                 p.queries.firstNotNullOfOrNull { q -> ApiClient.api.searchCards(q).data.firstOrNull() }?.also { ApiClient.cache[key] = it }
                                             }
                                             if (card != null) {
+                                                val rar = card.rarity?.lowercase() ?: ""
+                                                val resolvedFinish = when (curFinishMode) {
+                                                    "Normal", "Reverse", "Holo" -> curFinishMode
+                                                    else -> when {
+                                                        rar.contains("holo") && !rar.contains("reverse") && rar != "common" && rar != "uncommon" -> "Holo"
+                                                        glareRatio > 0.14f -> "Reverse"
+                                                        else -> "Normal"
+                                                    }
+                                                }
                                                 found = card
+                                                foundFinish = resolvedFinish
                                                 if (isManual || (curAuto && p.hasExactNumber && card.id != lastAddedId)) {
                                                     lastAddedId = card.id
                                                     lastAddedName = p.name
                                                     lastAddedBox = p.nameBox
                                                     lastAddTime = System.currentTimeMillis()
-                                                    onAdded(card); beepAndVib()
-                                                    status = "Добавлена: ${card.name} • жду следующую"
-                                                    banner = "+1 ${card.name} → ${curFolder ?: card.set.name}"
+                                                    onAdded(card, resolvedFinish); beepAndVib()
+                                                    status = "Добавлена: ${card.name} [$resolvedFinish]"
+                                                    banner = "+1 ${card.name} [$resolvedFinish] → ${curFolder ?: card.set.name}"
                                                 } else {
-                                                    status = "Найдено: ${card.name} (${card.set.name} #${card.number})"
+                                                    status = "Найдено: ${card.name} [$resolvedFinish] (#${card.number})"
                                                 }
                                             } else status = "Жду чёткий номер: ${p.displayLabel}"
                                         } catch (_: Exception) {} finally { busy = false }
@@ -268,7 +320,7 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
         }, modifier = Modifier.fillMaxSize())
 
         Column(Modifier.align(Alignment.TopCenter).fillMaxWidth().padding(12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-            Surface(color = Color.Black.copy(0.82f), shape = RoundedCornerShape(16.dp)) {
+            Surface(color = Color.Black.copy(0.84f), shape = RoundedCornerShape(16.dp)) {
                 Column(Modifier.padding(12.dp, 8.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(status, color = Color.White, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
@@ -279,6 +331,11 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
                             Icon(Icons.Default.RotateRight, null, tint = Color.White, modifier = Modifier.size(18.dp))
                         }
                         Switch(auto, { auto = it; if (!it) { lastAddedId = ""; lastAddedName = ""; lastAddedBox = null } })
+                    }
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        items(listOf("Авто", "Normal", "Reverse", "Holo")) { m ->
+                            FilterChip(finishMode == m, { finishMode = m }, { Text(if (m == "Авто") "Фольга: Авто" else m, fontSize = 11.sp) })
+                        }
                     }
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         item { FilterChip(activeFolder == null, { onSelFolder(null) }, { Text("Родной сет", fontSize = 11.sp) }) }
@@ -321,11 +378,11 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
                         AsyncImage(c.images.small, c.name, Modifier.size(60.dp, 84.dp).clip(RoundedCornerShape(8.dp)))
                         Spacer(Modifier.width(10.dp))
                         Column(Modifier.weight(1f)) {
-                            Text(c.name, fontWeight = FontWeight.Bold, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text("${c.name} [$foundFinish]", fontWeight = FontWeight.Bold, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             Text("${activeFolder ?: c.set.name} • #${c.number}", fontSize = 12.sp, color = Color.Gray, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             Spacer(Modifier.height(6.dp))
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Button({ onAdded(c); beepAndVib(); banner = "+1 ${c.name} → ${activeFolder ?: c.set.name}" }, Modifier.weight(1f)) { Text("+1", fontSize = 12.sp) }
+                                Button({ onAdded(c, foundFinish); beepAndVib(); banner = "+1 ${c.name} [$foundFinish]" }, Modifier.weight(1f)) { Text("+1", fontSize = 12.sp) }
                                 OutlinedButton({ found = null; lastQ = ""; lastAddedId = ""; lastAddedName = ""; lastAddedBox = null; status = "Бросайте карту..." }) { Text("Сброс", fontSize = 12.sp) }
                             }
                         }
@@ -410,13 +467,13 @@ fun FolderDlg(onDim: () -> Unit, onOk: (String) -> Unit) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun CollectionScreen(cards: List<CollectedCard>, folders: List<String>, onNewF: (String) -> Unit, onDelF: (String) -> Unit, onMove: (String, String) -> Unit, onInc: (String) -> Unit, onDec: (String) -> Unit) {
+fun CollectionScreen(cards: List<CollectedCard>, folders: List<String>, onNewF: (String) -> Unit, onDelF: (String) -> Unit, onMove: (String, String) -> Unit, onChgFin: (String) -> Unit, onInc: (String) -> Unit, onDec: (String) -> Unit) {
     val ctx = LocalContext.current
     var q by remember { mutableStateOf("") }; var set by remember { mutableStateOf("Все") }
     var dlg by remember { mutableStateOf(false) }; var mov by remember { mutableStateOf<CollectedCard?>(null) }
     val sets = remember(cards, folders) { listOf("Все") + (folders + cards.map { it.setName }).distinct().sorted() }
     LaunchedEffect(sets) { if (!sets.contains(set)) set = "Все" }
-    val list = remember(cards, q, set) { cards.filter { (set == "Все" || it.setName == set) && (q.isBlank() || it.name.contains(q, true) || it.number.contains(q, true) || it.setName.contains(q, true)) } }
+    val list = remember(cards, q, set) { cards.filter { (set == "Все" || it.setName == set) && (q.isBlank() || it.name.contains(q, true) || it.number.contains(q, true) || it.setName.contains(q, true) || (it.finish ?: "").contains(q, true)) } }
 
     if (dlg) FolderDlg({ dlg = false }) { onNewF(it); set = it.trim(); dlg = false }
     mov?.let { c ->
@@ -430,10 +487,10 @@ fun CollectionScreen(cards: List<CollectedCard>, folders: List<String>, onNewF: 
             Column { Text("Моя коллекция", fontSize = 22.sp, fontWeight = FontWeight.Bold); Text("Карт: ${list.sumOf { it.count }} (${list.size} уник.)", color = Color.Gray, fontSize = 13.sp) }
             Row {
                 IconButton({ dlg = true }) { Icon(Icons.Default.CreateNewFolder, null) }
-                IconButton({ ctx.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply { putExtra(Intent.EXTRA_TEXT, list.joinToString("\n") { "${it.count}x ${it.name} (${it.setName} #${it.number})" }); type = "text/plain" }, "Экспорт")) }, enabled = list.isNotEmpty()) { Icon(Icons.Default.Share, null) }
+                IconButton({ ctx.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply { putExtra(Intent.EXTRA_TEXT, list.joinToString("\n") { "${it.count}x ${it.name} [${it.finish ?: "Normal"}] (${it.setName} #${it.number})" }); type = "text/plain" }, "Экспорт")) }, enabled = list.isNotEmpty()) { Icon(Icons.Default.Share, null) }
             }
         }
-        Spacer(Modifier.height(8.dp)); OutlinedTextField(q, { q = it }, Modifier.fillMaxWidth(), placeholder = { Text("Поиск...") }, singleLine = true); Spacer(Modifier.height(8.dp))
+        Spacer(Modifier.height(8.dp)); OutlinedTextField(q, { q = it }, Modifier.fillMaxWidth(), placeholder = { Text("Поиск (имя, сет, Reverse)...") }, singleLine = true); Spacer(Modifier.height(8.dp))
         LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             items(sets) { s ->
                 val cnt = if (s == "Все") cards.sumOf { it.count } else cards.filter { it.setName == s }.sumOf { it.count }
@@ -445,11 +502,25 @@ fun CollectionScreen(cards: List<CollectedCard>, folders: List<String>, onNewF: 
         if (list.isEmpty()) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Пусто", color = Color.Gray) }
         else LazyVerticalGrid(GridCells.Fixed(2), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             items(list, key = { it.id }) { c ->
+                val fin = c.finish ?: "Normal"
+                val finColor = when (fin) {
+                    "Holo" -> Color(0xFFFFB300)
+                    "Reverse" -> Color(0xFF26C6DA)
+                    else -> Color(0xFF616161)
+                }
                 Card(shape = RoundedCornerShape(12.dp)) {
                     Column(Modifier.padding(8.dp)) {
                         Box {
                             AsyncImage(c.imageUrl, c.name, contentScale = ContentScale.FillWidth, modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)))
                             Box(Modifier.align(Alignment.TopEnd).padding(6.dp).background(MaterialTheme.colorScheme.primary, CircleShape).padding(8.dp, 4.dp)) { Text("x${c.count}", color = MaterialTheme.colorScheme.onPrimary, fontWeight = FontWeight.Bold, fontSize = 12.sp) }
+                            Box(
+                                Modifier
+                                    .align(Alignment.BottomStart)
+                                    .padding(6.dp)
+                                    .background(finColor.copy(alpha = 0.92f), RoundedCornerShape(6.dp))
+                                    .clickable { onChgFin(c.id) }
+                                    .padding(6.dp, 2.dp)
+                            ) { Text(fin, color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 10.sp) }
                         }
                         Spacer(Modifier.height(6.dp)); Text(c.name, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         Text("${c.setName} #${c.number}", fontSize = 11.sp, color = Color.Gray, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.clickable { mov = c })
