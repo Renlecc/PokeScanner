@@ -68,11 +68,14 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
+import retrofit2.HttpException
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
 import retrofit2.http.Body
 import retrofit2.http.GET
+import retrofit2.http.Header
 import retrofit2.http.POST
+import retrofit2.http.Path
 import retrofit2.http.Query
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -119,8 +122,13 @@ interface PokemonTcgApi {
 }
 
 interface GeminiApi {
-    @POST("v1beta/models/gemini-2.5-flash:generateContent")
-    suspend fun analyzeCard(@Query("key") apiKey: String, @Body body: GeminiRequest): GeminiResponse
+    @POST("{version}/models/{model}:generateContent")
+    suspend fun analyzeCard(
+        @Path("version") version: String,
+        @Path("model") model: String,
+        @Header("x-goog-api-key") apiKey: String,
+        @Body body: GeminiRequest
+    ): GeminiResponse
 }
 
 object ApiClient {
@@ -148,6 +156,7 @@ object ApiClient {
     }
 
     val cache = ConcurrentHashMap<String, PokemonCardDto>()
+    @Volatile var workingEndpoint: Pair<String, String>? = null
 }
 
 val SET_CODE_MAP = mapOf(
@@ -226,7 +235,7 @@ fun PokeCollectorApp() {
                 folders = folders,
                 activeFolder = scanFolder,
                 apiKey = apiKey,
-                onSaveApiKey = { apiKey = it; repo.saveApiKey(it) },
+                onSaveApiKey = { apiKey = it; repo.saveApiKey(it); ApiClient.workingEndpoint = null },
                 onSelFolder = { scanFolder = it },
                 onNewFolder = ::addF,
                 onAdded = { c, fin -> addC(c, scanFolder, fin) }
@@ -296,7 +305,36 @@ suspend fun identifyWithGemini(apiKey: String, base64Jpeg: String): GeminiCardRe
             )
         )
     )
-    val resp = ApiClient.gemini.analyzeCard(apiKey, req)
+
+    val candidates = buildList {
+        ApiClient.workingEndpoint?.let { add(it) }
+        add("v1beta" to "gemini-2.5-flash")
+        add("v1beta" to "gemini-2.5-flash-lite")
+        add("v1beta" to "gemini-2.0-flash")
+        add("v1" to "gemini-2.5-flash")
+    }.distinct()
+
+    var resp: GeminiResponse? = null
+    var lastError: Exception? = null
+
+    for ((ver, mod) in candidates) {
+        try {
+            resp = ApiClient.gemini.analyzeCard(ver, mod, apiKey.trim(), req)
+            ApiClient.workingEndpoint = ver to mod
+            break
+        } catch (e: HttpException) {
+            lastError = e
+            if (e.code() == 404) continue
+            val errBody = try { e.response()?.errorBody()?.string() } catch (_: Exception) { null }
+            val msg = errBody?.let { Regex("\"message\"\\s*:\\s*\"([^\"]+)\"").find(it)?.groupValues?.get(1) } ?: "HTTP ${e.code()}"
+            throw Exception(msg)
+        } catch (e: Exception) {
+            throw e
+        }
+    }
+
+    if (resp == null) throw (lastError ?: Exception("Модель не найдена (404)"))
+
     val rawText = resp.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text ?: return null
     val cleaned = rawText.removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
     return Gson().fromJson(cleaned, GeminiCardResult::class.java)
@@ -324,7 +362,7 @@ fun ScannerScreen(
     var busy by remember { mutableStateOf(false) }
     var auto by remember { mutableStateOf(true) }
     var useGemini by remember { mutableStateOf(true) }
-    var finishMode by remember { mutableStateOf("Авто") } // Авто, Normal, Reverse, Holo
+    var finishMode by remember { mutableStateOf("Авто") }
     var lastAddedSig by remember { mutableStateOf("") }
     var lastAddedBox by remember { mutableStateOf<Rect?>(null) }
     var lastAddTime by remember { mutableLongStateOf(0L) }
@@ -466,7 +504,7 @@ fun ScannerScreen(
                                                 status = if (isManual) "Gemini не увидел карту" else "Жду карту..."
                                             }
                                         } catch (e: Exception) {
-                                            status = "Ошибка Gemini: ${e.message?.take(32) ?: "сеть"}"
+                                            status = "Gemini: ${e.message?.take(42) ?: "ошибка сети"}"
                                         } finally {
                                             busy = false
                                         }
