@@ -13,6 +13,7 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
 import android.view.ViewGroup
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -97,6 +98,7 @@ class CollectionRepository(ctx: Context) {
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContent { MaterialTheme(colorScheme = darkColorScheme()) { PokeCollectorApp() } }
     }
 }
@@ -203,7 +205,6 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
                                         manualTrigger = false
                                         status = "Текст карты не виден"
                                     } else if (lastAddedName.isNotEmpty()) {
-                                        // Перекрытие рукой/картой при падении сбрасывает замок даже для 10 одинаковых карт подряд
                                         lastAddedName = ""
                                         lastAddedId = ""
                                         lastAddedBox = null
@@ -212,7 +213,6 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
                                     return@addOnSuccessListener
                                 }
 
-                                // Детектор сдвига в стопке: если упала новая копия того же покемона со смещением > 35px
                                 val prevBox = lastAddedBox
                                 val curBox = p.nameBox
                                 val shifted = if (prevBox != null && curBox != null) {
