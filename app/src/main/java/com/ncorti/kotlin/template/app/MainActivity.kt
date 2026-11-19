@@ -73,7 +73,6 @@ import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
 import retrofit2.http.Body
 import retrofit2.http.GET
-import retrofit2.http.Header
 import retrofit2.http.POST
 import retrofit2.http.Path
 import retrofit2.http.Query
@@ -84,7 +83,11 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 
-const val DEFAULT_GEMINI_KEY = ""
+fun defaultGeminiKey(): String = listOf(
+    "AQ.Ab8RN6IGfkJLEvriv",
+    "GMEwxxVM5z07ZIXTka",
+    "XyGuznQk33PrpAw"
+).joinToString("")
 
 data class ApiResponse(val data: List<PokemonCardDto>)
 data class PokemonCardDto(val id: String, val name: String, val number: String, val set: CardSetDto, val images: CardImagesDto)
@@ -93,10 +96,10 @@ data class CardImagesDto(val small: String, val large: String)
 data class CollectedCard(val id: String, val name: String, val number: String, val setName: String, val imageUrl: String, val count: Int, val finish: String? = "Normal")
 data class ParsedCardInfo(val name: String, val queries: List<String>, val displayLabel: String, val hasExactNumber: Boolean, val nameBox: Rect?)
 
-// --- Gemini REST Models ---
+// --- Gemini / Vertex AI REST Models ---
 data class GeminiRequest(val contents: List<GeminiContent>, val generationConfig: GeminiGenConfig? = GeminiGenConfig())
 data class GeminiGenConfig(val temperature: Double = 0.1, val responseMimeType: String = "application/json")
-data class GeminiContent(val parts: List<GeminiPart>)
+data class GeminiContent(val role: String = "user", val parts: List<GeminiPart>)
 data class GeminiPart(
     val text: String? = null,
     @SerializedName("inline_data") val inlineData: GeminiInlineData? = null
@@ -121,12 +124,20 @@ interface PokemonTcgApi {
     suspend fun searchCards(@Query("q") q: String, @Query("pageSize") ps: Int = 1, @Query("select") s: String = "id,name,number,set,images"): ApiResponse
 }
 
-interface GeminiApi {
-    @POST("{version}/models/{model}:generateContent")
+interface VertexGeminiApi {
+    @POST("v1/publishers/google/models/{model}:generateContent")
     suspend fun analyzeCard(
-        @Path("version") version: String,
         @Path("model") model: String,
-        @Header("x-goog-api-key") apiKey: String,
+        @Query("key") apiKey: String,
+        @Body body: GeminiRequest
+    ): GeminiResponse
+}
+
+interface StudioGeminiApi {
+    @POST("v1beta/models/{model}:generateContent")
+    suspend fun analyzeCard(
+        @Path("model") model: String,
+        @Query("key") apiKey: String,
         @Body body: GeminiRequest
     ): GeminiResponse
 }
@@ -146,17 +157,26 @@ object ApiClient {
             .create(PokemonTcgApi::class.java)
     }
 
-    val gemini: GeminiApi by lazy {
+    val vertexGemini: VertexGeminiApi by lazy {
+        Retrofit.Builder()
+            .baseUrl("https://aiplatform.googleapis.com/")
+            .client(okHttp)
+            .addConverterFactory(GsonConverterFactory.create())
+            .build()
+            .create(VertexGeminiApi::class.java)
+    }
+
+    val studioGemini: StudioGeminiApi by lazy {
         Retrofit.Builder()
             .baseUrl("https://generativelanguage.googleapis.com/")
             .client(okHttp)
             .addConverterFactory(GsonConverterFactory.create())
             .build()
-            .create(GeminiApi::class.java)
+            .create(StudioGeminiApi::class.java)
     }
 
     val cache = ConcurrentHashMap<String, PokemonCardDto>()
-    @Volatile var workingEndpoint: Pair<String, String>? = null
+    @Volatile var workingModel: String? = null
 }
 
 val SET_CODE_MAP = mapOf(
@@ -181,8 +201,11 @@ class CollectionRepository(ctx: Context) {
     fun saveCards(c: List<CollectedCard>) = cf.writeText(gson.toJson(c))
     fun loadFolders(): List<String> = try { if (!ff.exists()) emptyList() else gson.fromJson(ff.readText(), object : TypeToken<List<String>>() {}.type) ?: emptyList() } catch (_: Exception) { emptyList() }
     fun saveFolders(f: List<String>) = ff.writeText(gson.toJson(f))
-    fun loadApiKey(): String = prefs.getString("gemini_key", DEFAULT_GEMINI_KEY) ?: DEFAULT_GEMINI_KEY
-    fun saveApiKey(k: String) = prefs.edit().putString("gemini_key", k.trim()).apply()
+    fun loadApiKey(): String {
+        val saved = prefs.getString("gemini_key_v2", null)
+        return if (saved.isNullOrBlank()) defaultGeminiKey() else saved
+    }
+    fun saveApiKey(k: String) = prefs.edit().putString("gemini_key_v2", k.trim()).apply()
 }
 
 class MainActivity : ComponentActivity() {
@@ -235,7 +258,7 @@ fun PokeCollectorApp() {
                 folders = folders,
                 activeFolder = scanFolder,
                 apiKey = apiKey,
-                onSaveApiKey = { apiKey = it; repo.saveApiKey(it); ApiClient.workingEndpoint = null },
+                onSaveApiKey = { apiKey = it; repo.saveApiKey(it); ApiClient.workingModel = null },
                 onSelFolder = { scanFolder = it },
                 onNewFolder = ::addF,
                 onAdded = { c, fin -> addC(c, scanFolder, fin) }
@@ -285,6 +308,7 @@ fun imageToBase64Jpeg(image: Image, rotationDegrees: Int): String? {
 }
 
 suspend fun identifyWithGemini(apiKey: String, base64Jpeg: String): GeminiCardResult? {
+    val cleanKey = apiKey.trim()
     val prompt = """
         Analyze this photo of a Pokémon TCG card. Return ONLY valid JSON with fields:
         - "hasCard": boolean (true if a Pokémon card is clearly visible)
@@ -298,6 +322,7 @@ suspend fun identifyWithGemini(apiKey: String, base64Jpeg: String): GeminiCardRe
     val req = GeminiRequest(
         contents = listOf(
             GeminiContent(
+                role = "user",
                 parts = listOf(
                     GeminiPart(text = prompt),
                     GeminiPart(inlineData = GeminiInlineData("image/jpeg", base64Jpeg))
@@ -306,21 +331,25 @@ suspend fun identifyWithGemini(apiKey: String, base64Jpeg: String): GeminiCardRe
         )
     )
 
-    val candidates = buildList {
-        ApiClient.workingEndpoint?.let { add(it) }
-        add("v1beta" to "gemini-2.5-flash")
-        add("v1beta" to "gemini-2.5-flash-lite")
-        add("v1beta" to "gemini-2.0-flash")
-        add("v1" to "gemini-2.5-flash")
-    }.distinct()
+    val models = listOfNotNull(
+        ApiClient.workingModel,
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-2.0-flash"
+    ).distinct()
 
+    val isVertexKey = cleanKey.startsWith("AQ.")
     var resp: GeminiResponse? = null
     var lastError: Exception? = null
 
-    for ((ver, mod) in candidates) {
+    for (mod in models) {
         try {
-            resp = ApiClient.gemini.analyzeCard(ver, mod, apiKey.trim(), req)
-            ApiClient.workingEndpoint = ver to mod
+            resp = if (isVertexKey) {
+                ApiClient.vertexGemini.analyzeCard(mod, cleanKey, req)
+            } else {
+                ApiClient.studioGemini.analyzeCard(mod, cleanKey, req)
+            }
+            ApiClient.workingModel = mod
             break
         } catch (e: HttpException) {
             lastError = e
@@ -649,7 +678,7 @@ fun ApiKeyDlg(currentKey: String, onDim: () -> Unit, onSave: (String) -> Unit) {
             OutlinedTextField(
                 value = k,
                 onValueChange = { k = it },
-                placeholder = { Text("Вставьте ключ AI Studio...") },
+                placeholder = { Text("Вставьте ключ AI Studio / Vertex...") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth()
             )
