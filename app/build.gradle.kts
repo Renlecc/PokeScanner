@@ -12,7 +12,7 @@ val APP_VERSION_CODE: String by project
 val APP_ID: String by project
 
 android {
-    compileSdk = libs.versions.compile.sdk.version.get().toInt()
+    compileSdk = 36
 
     defaultConfig {
         minSdk = 26
@@ -47,6 +47,13 @@ android {
     }
 }
 
+configurations.all {
+    resolutionStrategy {
+        force("androidx.core:core:1.13.1")
+        force("androidx.core:core-ktx:1.13.1")
+    }
+}
+
 tasks.withType<KotlinCompile>().configureEach {
     compilerOptions {
         jvmTarget.set(JvmTarget.JVM_17)
@@ -59,7 +66,7 @@ dependencies {
     implementation(projects.libraryKotlin)
 
     implementation(libs.androidx.appcompat)
-    implementation(libs.androidx.core.ktx)
+    implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.activity:activity-compose:1.9.1")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
 
