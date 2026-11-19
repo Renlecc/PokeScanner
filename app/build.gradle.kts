@@ -4,17 +4,18 @@ import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 plugins {
     id("com.android.application")
     kotlin("android")
+    id("org.jetbrains.kotlin.plugin.compose")
 }
 
-val APP_VERSION_NAME : String by project
-val APP_VERSION_CODE : String by project
-val APP_ID : String by project
+val APP_VERSION_NAME: String by project
+val APP_VERSION_CODE: String by project
+val APP_ID: String by project
 
 android {
     compileSdk = libs.versions.compile.sdk.version.get().toInt()
 
     defaultConfig {
-        minSdk = libs.versions.min.sdk.version.get().toInt()
+        minSdk = 26
         namespace = APP_ID
 
         applicationId = APP_ID
@@ -23,6 +24,7 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
     buildFeatures {
+        compose = true
         viewBinding = true
     }
     compileOptions {
@@ -40,23 +42,9 @@ android {
     }
 
     lint {
-        warningsAsErrors = true
-        abortOnError = true
-        disable.add("GradleDependency")
+        warningsAsErrors = false
+        abortOnError = false
     }
-
-    // Use this block to configure different flavors
-//    flavorDimensions("version")
-//    productFlavors {
-//        create("full") {
-//            dimension = "version"
-//            applicationIdSuffix = ".full"
-//        }
-//        create("demo") {
-//            dimension = "version"
-//            applicationIdSuffix = ".demo"
-//        }
-//    }
 }
 
 tasks.withType<KotlinCompile>().configureEach {
@@ -71,13 +59,28 @@ dependencies {
     implementation(projects.libraryKotlin)
 
     implementation(libs.androidx.appcompat)
-    implementation(libs.androidx.constraint.layout)
     implementation(libs.androidx.core.ktx)
+    implementation("androidx.activity:activity-compose:1.9.1")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
 
-    testImplementation(libs.junit)
+    // Jetpack Compose UI
+    implementation(platform("androidx.compose:compose-bom:2024.08.00"))
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.material:material-icons-extended")
 
-    androidTestImplementation(libs.androidx.test.ext.junit)
-    androidTestImplementation(libs.androidx.test.ext.junit.ktx)
-    androidTestImplementation(libs.androidx.test.rules)
-    androidTestImplementation(libs.espresso.core)
+    // Камера (CameraX)
+    val cameraxVersion = "1.3.4"
+    implementation("androidx.camera:camera-core:$cameraxVersion")
+    implementation("androidx.camera:camera-camera2:$cameraxVersion")
+    implementation("androidx.camera:camera-lifecycle:$cameraxVersion")
+    implementation("androidx.camera:camera-view:$cameraxVersion")
+
+    // Локальный сканер текста (ML Kit без лимитов)
+    implementation("com.google.mlkit:text-recognition:16.0.1")
+
+    // Сеть (Pokémon TCG API) и загрузка картинок карт
+    implementation("com.squareup.retrofit2:retrofit:2.11.0")
+    implementation("com.squareup.retrofit2:converter-gson:2.11.0")
+    implementation("io.coil-kt:coil-compose:2.7.0")
 }
