@@ -51,6 +51,10 @@ configurations.all {
     resolutionStrategy {
         force("androidx.core:core:1.15.0")
         force("androidx.core:core-ktx:1.15.0")
+        force("androidx.activity:activity:1.9.3")
+        force("androidx.activity:activity-ktx:1.9.3")
+        force("androidx.activity:activity-compose:1.9.3")
+        force("androidx.appcompat:appcompat:1.7.0")
     }
 }
 
@@ -65,7 +69,7 @@ dependencies {
     implementation(projects.libraryCompose)
     implementation(projects.libraryKotlin)
 
-    implementation(libs.androidx.appcompat)
+    implementation("androidx.appcompat:appcompat:1.7.0")
     implementation(libs.androidx.constraint.layout)
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.activity:activity-compose:1.9.3")
