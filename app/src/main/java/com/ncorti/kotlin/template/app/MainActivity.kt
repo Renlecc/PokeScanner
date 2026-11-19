@@ -63,6 +63,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import coil.compose.AsyncImage
 import com.google.gson.Gson
+import com.google.gson.JsonParser
 import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -127,17 +128,15 @@ interface PokemonTcgApi {
     @GET("v2/cards")
     suspend fun getCardsBySet(
         @Query("q") q: String,
-        @Query("pageSize") ps: Int = 250,
-        @Query("page") page: Int = 1,
-        @Query("select") s: String = "id,name,number,set,images"
+        @Query("pageSize") ps: Int = 50,
+        @Query("page") page: Int = 1
     ): ApiResponse
 
     @GET("v2/sets")
     suspend fun getAllSets(
         @Query("pageSize") ps: Int = 250,
         @Query("page") page: Int = 1,
-        @Query("orderBy") orderBy: String = "-releaseDate",
-        @Query("select") s: String = "id,name,series,ptcgoCode,total,releaseDate"
+        @Query("orderBy") orderBy: String = "-releaseDate"
     ): SetsApiResponse
 }
 
@@ -375,17 +374,18 @@ fun extractCardCropBitmap(image: Image, rotationDegrees: Int): Bitmap? {
             }
         } else bmp
 
+        // Увеличенная рамка под карту (пропорция 2.5 : 3.5)
         val w = rotated.width
         val h = rotated.height
         val targetRatio = 2.5f / 3.5f
-        var cropW = (w * 0.62f).toInt()
+        var cropW = (w * 0.80f).toInt()
         var cropH = (cropW / targetRatio).toInt()
         if (cropH > h * 0.68f) {
             cropH = (h * 0.68f).toInt()
             cropW = (cropH * targetRatio).toInt()
         }
         val left = ((w - cropW) / 2).coerceAtLeast(0)
-        val top = ((h - cropH) / 2 + (h * 0.04f).toInt()).coerceIn(0, (h - cropH).coerceAtLeast(0))
+        val top = ((h - cropH) / 2 + (h * 0.03f).toInt()).coerceIn(0, (h - cropH).coerceAtLeast(0))
 
         val cropped = Bitmap.createBitmap(rotated, left, top, cropW.coerceAtMost(w - left), cropH.coerceAtMost(h - top))
         if (cropped != rotated) rotated.recycle()
@@ -403,12 +403,52 @@ suspend fun downloadAndHashSet(
     val label = targetSet.ptcgoCode ?: targetSet.id.uppercase()
     onProgress("Загружаю список карт $label...")
     val allDtos = mutableListOf<PokemonCardDto>()
-    var page = 1
-    while (true) {
-        val resp = ApiClient.api.getCardsBySet("set.id:${targetSet.id}", 250, page)
-        allDtos.addAll(resp.data)
-        if (resp.data.size < 250) break
-        page++
+
+    try {
+        var page = 1
+        while (true) {
+            var resp: ApiResponse? = null
+            for (attempt in 1..3) {
+                try {
+                    resp = ApiClient.api.getCardsBySet("set.id:${targetSet.id}", 50, page)
+                    break
+                } catch (e: Exception) {
+                    if (attempt == 3) throw e
+                    delay(800)
+                }
+            }
+            val list = resp?.data ?: emptyList()
+            allDtos.addAll(list)
+            onProgress("$label: получено ${allDtos.size} карт...")
+            if (list.size < 50) break
+            page++
+        }
+    } catch (_: Exception) {
+        onProgress("$label: пробую резервный сервер TCGdex...")
+        val req = Request.Builder().url("https://api.tcgdex.net/v2/en/sets/${targetSet.id}").build()
+        ApiClient.okHttp.newCall(req).execute().use { r ->
+            if (!r.isSuccessful) throw Exception("Сервер недоступен (${r.code})")
+            val body = r.body?.string() ?: throw Exception("Пустой ответ")
+            val json = JsonParser.parseString(body).asJsonObject
+            val cardsArr = json.getAsJsonArray("cards") ?: throw Exception("Карты не найдены")
+            for (el in cardsArr) {
+                val obj = el.asJsonObject
+                val cid = obj.get("id")?.asString ?: continue
+                val cname = obj.get("name")?.asString ?: continue
+                val localId = obj.get("localId")?.asString ?: ""
+                val imgBase = obj.get("image")?.asString ?: continue
+                val imgUrl = "$imgBase/low.webp"
+                allDtos.add(
+                    PokemonCardDto(
+                        id = cid,
+                        name = cname,
+                        number = localId,
+                        set = CardSetDto(targetSet.id, targetSet.name),
+                        images = CardImagesDto(imgUrl, "$imgBase/high.webp")
+                    )
+                )
+            }
+        }
     }
 
     val existingIds = existingDb.map { it.id }.toSet()
@@ -608,23 +648,24 @@ fun ScannerScreen(
             }
         }, modifier = Modifier.fillMaxSize())
 
+        // Большая рамка под карту (пропорция 2.5 x 3.5)
         Canvas(modifier = Modifier.fillMaxSize()) {
             val targetRatio = 2.5f / 3.5f
-            var boxW = size.width * 0.64f
+            var boxW = size.width * 0.82f
             var boxH = boxW / targetRatio
-            if (boxH > size.height * 0.56f) {
-                boxH = size.height * 0.56f
+            if (boxH > size.height * 0.66f) {
+                boxH = size.height * 0.66f
                 boxW = boxH * targetRatio
             }
             val left = (size.width - boxW) / 2f
-            val top = (size.height - boxH) / 2f + size.height * 0.04f
+            val top = (size.height - boxH) / 2f + size.height * 0.03f
 
             drawRoundRect(
-                color = if (lastAddedCardId.isNotEmpty()) Color(0xFF4CAF50) else Color.White.copy(alpha = 0.85f),
+                color = if (lastAddedCardId.isNotEmpty()) Color(0xFF4CAF50) else Color.White.copy(alpha = 0.88f),
                 topLeft = Offset(left, top),
                 size = Size(boxW, boxH),
-                cornerRadius = CornerRadius(24f, 24f),
-                style = Stroke(width = 6f)
+                cornerRadius = CornerRadius(28f, 28f),
+                style = Stroke(width = 7f)
             )
         }
 
