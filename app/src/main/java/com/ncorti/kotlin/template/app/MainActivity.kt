@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Rect
 import android.media.AudioManager
 import android.media.ToneGenerator
 import android.os.Build
@@ -64,13 +65,14 @@ import retrofit2.http.Query
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import kotlin.math.abs
 
 data class ApiResponse(val data: List<PokemonCardDto>)
 data class PokemonCardDto(val id: String, val name: String, val number: String, val set: CardSetDto, val images: CardImagesDto)
 data class CardSetDto(val name: String)
 data class CardImagesDto(val small: String, val large: String)
 data class CollectedCard(val id: String, val name: String, val number: String, val setName: String, val imageUrl: String, val count: Int)
-data class ParsedCardInfo(val queries: List<String>, val displayLabel: String, val hasExactNumber: Boolean)
+data class ParsedCardInfo(val name: String, val queries: List<String>, val displayLabel: String, val hasExactNumber: Boolean, val nameBox: Rect?)
 
 interface PokemonTcgApi {
     @GET("v2/cards")
@@ -144,14 +146,16 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
     val launch = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { perm = it }
     LaunchedEffect(Unit) { if (!perm) launch.launch(Manifest.permission.CAMERA) }
 
-    var status by remember { mutableStateOf("Жду карту...") }
+    var status by remember { mutableStateOf("Бросайте карту...") }
     var found by remember { mutableStateOf<PokemonCardDto?>(null) }
     var busy by remember { mutableStateOf(false) }
     var lastQ by remember { mutableStateOf("") }; var lastQT by remember { mutableLongStateOf(0L) }
     var auto by remember { mutableStateOf(true) }
-    var locked by remember { mutableStateOf(false) }
+    var lastAddedId by remember { mutableStateOf("") }
+    var lastAddedName by remember { mutableStateOf("") }
+    var lastAddedBox by remember { mutableStateOf<Rect?>(null) }
+    var lastAddTime by remember { mutableLongStateOf(0L) }
     var manualTrigger by remember { mutableStateOf(false) }
-    var emptyFrames by remember { mutableIntStateOf(0) }
     var banner by remember { mutableStateOf<String?>(null) }
     var dlg by remember { mutableStateOf(false) }
     var torch by remember { mutableStateOf(false) }
@@ -170,7 +174,7 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
     }
 
     LaunchedEffect(torch, camCtrl) { try { camCtrl?.cameraControl?.enableTorch(torch) } catch (_: Exception) {} }
-    LaunchedEffect(banner) { if (banner != null) { delay(1300); banner = null } }
+    LaunchedEffect(banner) { if (banner != null) { delay(1200); banner = null } }
     if (dlg) FolderDlg({ dlg = false }) { onNewFolder(it); onSelFolder(it.trim()); dlg = false }
     if (!perm) { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Button({ launch.launch(Manifest.permission.CAMERA) }) { Text("Разрешить камеру") } }; return }
 
@@ -185,7 +189,7 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
                     var lastT = 0L
                     an.setAnalyzer(Executors.newSingleThreadExecutor()) { px ->
                         val now = System.currentTimeMillis()
-                        if (!manualTrigger && now - lastT < 380) { px.close(); return@setAnalyzer }
+                        if (!manualTrigger && now - lastT < 150) { px.close(); return@setAnalyzer }
                         @androidx.camera.core.ExperimentalGetImage val img = px.image
                         if (img != null) {
                             lastT = now
@@ -198,19 +202,36 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
                                     if (isManual) {
                                         manualTrigger = false
                                         status = "Текст карты не виден"
-                                    }
-                                    emptyFrames++
-                                    if (emptyFrames >= 3 && locked) {
-                                        locked = false
+                                    } else if (lastAddedName.isNotEmpty()) {
+                                        // Перекрытие рукой/картой при падении сбрасывает замок даже для 10 одинаковых карт подряд
+                                        lastAddedName = ""
+                                        lastAddedId = ""
+                                        lastAddedBox = null
                                         lastQ = ""
-                                        if (!busy) status = "Готов к следующей карте..."
                                     }
                                     return@addOnSuccessListener
                                 }
-                                emptyFrames = 0
-                                if (!isManual && locked && curAuto) return@addOnSuccessListener
+
+                                // Детектор сдвига в стопке: если упала новая копия того же покемона со смещением > 35px
+                                val prevBox = lastAddedBox
+                                val curBox = p.nameBox
+                                val shifted = if (prevBox != null && curBox != null) {
+                                    abs(prevBox.centerX() - curBox.centerX()) > 35 || abs(prevBox.centerY() - curBox.centerY()) > 35
+                                } else false
+
+                                if (!isManual && curAuto && lastAddedName.isNotEmpty() && p.name.equals(lastAddedName, ignoreCase = true)) {
+                                    if (shifted && t - lastAddTime > 650) {
+                                        lastAddedName = ""
+                                        lastAddedId = ""
+                                        lastAddedBox = null
+                                        lastQ = ""
+                                    } else {
+                                        return@addOnSuccessListener
+                                    }
+                                }
+
                                 val key = p.queries.firstOrNull() ?: return@addOnSuccessListener
-                                if (!busy && (isManual || key != lastQ || t - lastQT > 2500)) {
+                                if (!busy && (isManual || key != lastQ || t - lastQT > 1800)) {
                                     manualTrigger = false
                                     lastQ = key; lastQT = t; status = "Ищу: ${p.displayLabel}"; busy = true
                                     scope.launch {
@@ -220,10 +241,13 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
                                             }
                                             if (card != null) {
                                                 found = card
-                                                if (isManual || (curAuto && p.hasExactNumber && !locked)) {
-                                                    locked = true
+                                                if (isManual || (curAuto && p.hasExactNumber && card.id != lastAddedId)) {
+                                                    lastAddedId = card.id
+                                                    lastAddedName = p.name
+                                                    lastAddedBox = p.nameBox
+                                                    lastAddTime = System.currentTimeMillis()
                                                     onAdded(card); beepAndVib()
-                                                    status = "ГОТОВО: ${card.name} (уберите карту)"
+                                                    status = "Добавлена: ${card.name} • жду следующую"
                                                     banner = "+1 ${card.name} → ${curFolder ?: card.set.name}"
                                                 } else {
                                                     status = "Найдено: ${card.name} (${card.set.name} #${card.number})"
@@ -251,10 +275,10 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
                         IconButton({ torch = !torch }, Modifier.size(32.dp)) {
                             Icon(if (torch) Icons.Default.FlashOn else Icons.Default.FlashOff, null, tint = if (torch) Color(0xFFFFD54F) else Color.White, modifier = Modifier.size(18.dp))
                         }
-                        IconButton({ extraRot = (extraRot + 90) % 360; lastQ = ""; locked = false; status = "Поворот: $extraRot°" }, Modifier.size(32.dp)) {
+                        IconButton({ extraRot = (extraRot + 90) % 360; lastQ = ""; lastAddedId = ""; lastAddedName = ""; lastAddedBox = null; status = "Поворот: $extraRot°" }, Modifier.size(32.dp)) {
                             Icon(Icons.Default.RotateRight, null, tint = Color.White, modifier = Modifier.size(18.dp))
                         }
-                        Switch(auto, { auto = it; if (!it) locked = false })
+                        Switch(auto, { auto = it; if (!it) { lastAddedId = ""; lastAddedName = ""; lastAddedBox = null } })
                     }
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         item { FilterChip(activeFolder == null, { onSelFolder(null) }, { Text("Родной сет", fontSize = 11.sp) }) }
@@ -272,7 +296,9 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
         ) {
             FilledTonalButton(
                 onClick = {
-                    locked = false
+                    lastAddedId = ""
+                    lastAddedName = ""
+                    lastAddedBox = null
                     lastQ = ""
                     manualTrigger = true
                     status = "Ручной снимок..."
@@ -300,7 +326,7 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
                             Spacer(Modifier.height(6.dp))
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 Button({ onAdded(c); beepAndVib(); banner = "+1 ${c.name} → ${activeFolder ?: c.set.name}" }, Modifier.weight(1f)) { Text("+1", fontSize = 12.sp) }
-                                OutlinedButton({ found = null; lastQ = ""; locked = false; status = "Жду карту..." }) { Text("Сброс", fontSize = 12.sp) }
+                                OutlinedButton({ found = null; lastQ = ""; lastAddedId = ""; lastAddedName = ""; lastAddedBox = null; status = "Бросайте карту..." }) { Text("Сброс", fontSize = 12.sp) }
                             }
                         }
                     }
@@ -347,6 +373,7 @@ fun parseCardClean(vt: Text): ParsedCardInfo? {
     val badPrefix = Regex("""^(STAGE\s*\d*|STAG\w*|GTAG\w*|BASIC|BASI\w*|VMAX|VSTAR|TRAINER|SUPPORTER|ITEM|STADIUM|ENERGY)\s+""", RegexOption.IGNORE_CASE)
     val noise = setOf("BASIC", "STAGE", "STAGE 1", "STAGE 2", "VMAX", "VSTAR", "TRAINER", "SUPPORTER", "ITEM", "STADIUM", "ENERGY")
     var name: String? = null
+    var nameBox: Rect? = null
     for (l in lines.take(8)) {
         var t = l.text.trim()
             .replace(badPrefix, "")
@@ -361,6 +388,7 @@ fun parseCardClean(vt: Text): ParsedCardInfo? {
         val u = t.uppercase()
         if (t.length in 3..26 && !noise.contains(u) && !u.startsWith("EVOLVES") && !u.startsWith("STAG") && !u.startsWith("GTAG") && t.any { it.isLetter() }) {
             name = t
+            nameBox = l.boundingBox
             break
         }
     }
@@ -370,7 +398,7 @@ fun parseCardClean(vt: Text): ParsedCardInfo? {
     if (num != null) qs.add("name:\"$n\" number:$num")
     if (qs.isEmpty()) qs.add("name:\"$n\"")
     val label = if (num != null) "$n #$num" + (total?.let { "/$it" } ?: "") else n
-    return ParsedCardInfo(qs, label, num != null)
+    return ParsedCardInfo(n, qs, label, num != null, nameBox)
 }
 
 @Composable
