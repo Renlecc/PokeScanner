@@ -147,7 +147,7 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
     var busy by remember { mutableStateOf(false) }
     var lastQ by remember { mutableStateOf("") }; var lastQT by remember { mutableLongStateOf(0L) }
     var auto by remember { mutableStateOf(true) }
-    var lastId by remember { mutableStateOf("") }
+    var locked by remember { mutableStateOf(false) }
     var emptyFrames by remember { mutableIntStateOf(0) }
     var banner by remember { mutableStateOf<String?>(null) }
     var dlg by remember { mutableStateOf(false) }
@@ -177,15 +177,16 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
                                 val p = parseCardClean(v); val t = System.currentTimeMillis()
                                 if (p == null) {
                                     emptyFrames++
-                                    if (emptyFrames >= 2 && lastId.isNotEmpty()) {
-                                        lastId = ""
+                                    if (emptyFrames >= 3 && locked) {
+                                        locked = false
                                         lastQ = ""
-                                        if (!busy) status = "Жду следующую карту..."
+                                        if (!busy) status = "Готов к следующей карте..."
                                     }
                                     return@addOnSuccessListener
                                 }
                                 emptyFrames = 0
-                                val key = p.queries.firstOrNull() ?: ""
+                                if (locked && curAuto) return@addOnSuccessListener
+                                val key = p.queries.firstOrNull() ?: return@addOnSuccessListener
                                 if (!busy && (key != lastQ || t - lastQT > 2500)) {
                                     lastQ = key; lastQT = t; status = "Ищу: ${p.displayLabel}"; busy = true
                                     scope.launch {
@@ -195,17 +196,15 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
                                             }
                                             if (card != null) {
                                                 found = card
-                                                if (curAuto && p.hasExactNumber && card.id != lastId) {
-                                                    lastId = card.id
+                                                if (curAuto && p.hasExactNumber && !locked) {
+                                                    locked = true
                                                     onAdded(card); vib()
-                                                    status = "Записано: ${card.name} (уберите карту)"
+                                                    status = "Готово: ${card.name} (уберите карту)"
                                                     banner = "+1 ${card.name} → ${curFolder ?: card.set.name}"
-                                                } else if (card.id == lastId) {
-                                                    status = "Уже записана: ${card.name} (уберите карту)"
                                                 } else {
                                                     status = "Найдено: ${card.name} (${card.set.name} #${card.number})"
                                                 }
-                                            } else status = "Не найдено: ${p.displayLabel}"
+                                            } else status = "Жду чёткий номер: ${p.displayLabel}"
                                         } catch (_: Exception) {} finally { busy = false }
                                     }
                                 }
@@ -223,7 +222,7 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(status, color = Color.White, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
                         Text(if (auto) "Авто: ВКЛ" else "Авто: ВЫКЛ", color = if (auto) Color(0xFF4CAF50) else Color.LightGray, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                        Spacer(Modifier.width(6.dp)); Switch(auto, { auto = it })
+                        Spacer(Modifier.width(6.dp)); Switch(auto, { auto = it; if (!it) locked = false })
                     }
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         item { FilterChip(activeFolder == null, { onSelFolder(null) }, { Text("Родной сет", fontSize = 11.sp) }) }
@@ -246,7 +245,7 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
                         Spacer(Modifier.height(8.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Button({ onAdded(c); vib(); banner = "+1 ${c.name} → ${activeFolder ?: c.set.name}" }, Modifier.weight(1f)) { Text("+1 вручную") }
-                            OutlinedButton({ found = null; lastQ = ""; lastId = ""; status = "Жду карту..." }) { Text("Сброс") }
+                            OutlinedButton({ found = null; lastQ = ""; locked = false; status = "Жду карту..." }) { Text("Сброс") }
                         }
                     }
                 }
@@ -313,7 +312,7 @@ fun parseCardClean(vt: Text): ParsedCardInfo? {
     val qs = mutableListOf<String>()
     if (num != null && total != null) qs.add("name:\"$n\" number:$num set.printedTotal:$total")
     if (num != null) qs.add("name:\"$n\" number:$num")
-    qs.add("name:\"$n\"")
+    if (qs.isEmpty()) qs.add("name:\"$n\"")
     val label = if (num != null) "$n #$num" + (total?.let { "/$it" } ?: "") else n
     return ParsedCardInfo(qs, label, num != null)
 }
