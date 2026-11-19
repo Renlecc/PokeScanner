@@ -72,39 +72,22 @@ data class ParsedCardInfo(val primaryQuery: String, val fallbackQuery: String?, 
 
 interface PokemonTcgApi {
     @GET("v2/cards")
-    suspend fun searchCards(
-        @Query("q") query: String,
-        @Query("pageSize") pageSize: Int = 1,
-        @Query("select") select: String = "id,name,number,set,images"
-    ): ApiResponse
+    suspend fun searchCards(@Query("q") q: String, @Query("pageSize") ps: Int = 1, @Query("select") s: String = "id,name,number,set,images"): ApiResponse
 }
 
 object ApiClient {
-    val api: PokemonTcgApi by lazy {
-        Retrofit.Builder().baseUrl("https://api.pokemontcg.io/")
-            .addConverterFactory(GsonConverterFactory.create()).build().create(PokemonTcgApi::class.java)
-    }
+    val api: PokemonTcgApi by lazy { Retrofit.Builder().baseUrl("https://api.pokemontcg.io/").addConverterFactory(GsonConverterFactory.create()).build().create(PokemonTcgApi::class.java) }
     val cache = ConcurrentHashMap<String, PokemonCardDto>()
 }
 
-class CollectionRepository(context: Context) {
-    private val cardsFile = File(context.filesDir, "pokemon_collection.json")
-    private val foldersFile = File(context.filesDir, "custom_folders.json")
+class CollectionRepository(ctx: Context) {
+    private val cf = File(ctx.filesDir, "pokemon_collection.json")
+    private val ff = File(ctx.filesDir, "custom_folders.json")
     private val gson = Gson()
-
-    fun loadCards(): List<CollectedCard> = try {
-        if (!cardsFile.exists()) emptyList()
-        else gson.fromJson(cardsFile.readText(), object : TypeToken<List<CollectedCard>>() {}.type) ?: emptyList()
-    } catch (_: Exception) { emptyList() }
-
-    fun saveCards(cards: List<CollectedCard>) = cardsFile.writeText(gson.toJson(cards))
-
-    fun loadFolders(): List<String> = try {
-        if (!foldersFile.exists()) emptyList()
-        else gson.fromJson(foldersFile.readText(), object : TypeToken<List<String>>() {}.type) ?: emptyList()
-    } catch (_: Exception) { emptyList() }
-
-    fun saveFolders(folders: List<String>) = foldersFile.writeText(gson.toJson(folders))
+    fun loadCards(): List<CollectedCard> = try { if (!cf.exists()) emptyList() else gson.fromJson(cf.readText(), object : TypeToken<List<CollectedCard>>() {}.type) ?: emptyList() } catch (_: Exception) { emptyList() }
+    fun saveCards(c: List<CollectedCard>) = cf.writeText(gson.toJson(c))
+    fun loadFolders(): List<String> = try { if (!ff.exists()) emptyList() else gson.fromJson(ff.readText(), object : TypeToken<List<String>>() {}.type) ?: emptyList() } catch (_: Exception) { emptyList() }
+    fun saveFolders(f: List<String>) = ff.writeText(gson.toJson(f))
 }
 
 class MainActivity : ComponentActivity() {
@@ -116,192 +99,135 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun PokeCollectorApp() {
-    val context = LocalContext.current
-    val repo = remember { CollectionRepository(context) }
-    var collection by remember { mutableStateOf(repo.loadCards()) }
-    var customFolders by remember { mutableStateOf(repo.loadFolders()) }
-    var activeScanFolder by remember { mutableStateOf<String?>(null) }
-    var selectedTab by remember { mutableIntStateOf(0) }
+    val ctx = LocalContext.current
+    val repo = remember { CollectionRepository(ctx) }
+    var cards by remember { mutableStateOf(repo.loadCards()) }
+    var folders by remember { mutableStateOf(repo.loadFolders()) }
+    var scanFolder by remember { mutableStateOf<String?>(null) }
+    var tab by remember { mutableIntStateOf(0) }
 
-    fun updateCollection(newList: List<CollectedCard>) { collection = newList; repo.saveCards(newList) }
-    fun createFolder(name: String) {
-        val clean = name.trim()
-        if (clean.isNotEmpty() && !customFolders.contains(clean)) {
-            customFolders = customFolders + clean; repo.saveFolders(customFolders)
-        }
+    fun upd(l: List<CollectedCard>) { cards = l; repo.saveCards(l) }
+    fun addF(n: String) { val c = n.trim(); if (c.isNotEmpty() && !folders.contains(c)) { folders = folders + c; repo.saveFolders(folders) } }
+    fun delF(n: String) { folders = folders.filter { it != n }; repo.saveFolders(folders); if (scanFolder == n) scanFolder = null }
+    fun addC(c: PokemonCardDto, tf: String?) {
+        val set = tf ?: c.set.name; val eid = "${c.id}::$set"; val ex = cards.find { it.id == eid }
+        upd(if (ex != null) cards.map { if (it.id == eid) it.copy(count = it.count + 1) else it } else listOf(CollectedCard(eid, c.name, c.number, set, c.images.small, 1)) + cards)
     }
-    fun deleteFolder(name: String) {
-        customFolders = customFolders.filter { it != name }; repo.saveFolders(customFolders)
-        if (activeScanFolder == name) activeScanFolder = null
-    }
-    fun addOrIncrementCard(card: PokemonCardDto, targetFolder: String?) {
-        val resolvedSet = targetFolder ?: card.set.name
-        val entryId = "${card.id}::$resolvedSet"
-        val existing = collection.find { it.id == entryId }
-        updateCollection(if (existing != null) collection.map { if (it.id == entryId) it.copy(count = it.count + 1) else it }
-        else listOf(CollectedCard(entryId, card.name, card.number, resolvedSet, card.images.small, 1)) + collection)
-    }
-    fun moveCardToFolder(cardId: String, newFolder: String) {
-        val target = collection.find { it.id == cardId } ?: return
-        if (target.setName == newFolder) return
-        val newId = "${target.id.substringBefore("::")}::$newFolder"
-        val existing = collection.find { it.id == newId }
-        updateCollection(if (existing != null) collection.filter { it.id != cardId }.map { if (it.id == newId) it.copy(count = it.count + target.count) else it }
-        else collection.map { if (it.id == cardId) it.copy(id = newId, setName = newFolder) else it })
+    fun movC(cid: String, nf: String) {
+        val t = cards.find { it.id == cid } ?: return; if (t.setName == nf) return
+        val nid = "${t.id.substringBefore("::")}::$nf"; val ex = cards.find { it.id == nid }
+        upd(if (ex != null) cards.filter { it.id != cid }.map { if (it.id == nid) it.copy(count = it.count + t.count) else it } else cards.map { if (it.id == cid) it.copy(id = nid, setName = nf) else it })
     }
 
     Scaffold(bottomBar = {
         NavigationBar {
-            NavigationBarItem(selected = selectedTab == 0, onClick = { selectedTab = 0 }, icon = { Icon(Icons.Default.QrCodeScanner, null) }, label = { Text("Сканер ∞") })
-            NavigationBarItem(selected = selectedTab == 1, onClick = { selectedTab = 1 }, icon = { Icon(Icons.Default.CollectionsBookmark, null) }, label = { Text("Коллекция (${collection.sumOf { it.count }})") })
+            NavigationBarItem(tab == 0, { tab = 0 }, { Icon(Icons.Default.QrCodeScanner, null) }, label = { Text("Сканер ∞") })
+            NavigationBarItem(tab == 1, { tab = 1 }, { Icon(Icons.Default.CollectionsBookmark, null) }, label = { Text("Коллекция (${cards.sumOf { it.count }})") })
         }
-    }) { padding ->
-        Box(Modifier.padding(padding).fillMaxSize()) {
-            if (selectedTab == 0) {
-                ScannerScreen(customFolders, activeScanFolder, { activeScanFolder = it }, { createFolder(it) }, { addOrIncrementCard(it, activeScanFolder) })
-            } else {
-                CollectionScreen(collection, customFolders, { createFolder(it) }, { deleteFolder(it) }, { id, f -> moveCardToFolder(id, f) },
-                    { id -> updateCollection(collection.map { if (it.id == id) it.copy(count = it.count + 1) else it }) },
-                    { id -> updateCollection(collection.mapNotNull { if (it.id != id) it else if (it.count > 1) it.copy(count = it.count - 1) else null }) })
-            }
+    }) { p ->
+        Box(Modifier.padding(p).fillMaxSize()) {
+            if (tab == 0) ScannerScreen(folders, scanFolder, { scanFolder = it }, ::addF) { addC(it, scanFolder) }
+            else CollectionScreen(cards, folders, ::addF, ::delF, ::movC,
+                { id -> upd(cards.map { if (it.id == id) it.copy(count = it.count + 1) else it }) },
+                { id -> upd(cards.mapNotNull { if (it.id != id) it else if (it.count > 1) it.copy(count = it.count - 1) else null }) })
         }
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ScannerScreen(
-    customFolders: List<String>, activeScanFolder: String?,
-    onSelectScanFolder: (String?) -> Unit, onCreateFolder: (String) -> Unit, onCardAdded: (PokemonCardDto) -> Unit
-) {
-    val context = LocalContext.current
-    val lifecycleOwner = LocalLifecycleOwner.current
-    val scope = rememberCoroutineScope()
-    var hasPermission by remember { mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) }
-    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { hasPermission = it }
-    LaunchedEffect(Unit) { if (!hasPermission) launcher.launch(Manifest.permission.CAMERA) }
+fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (String?) -> Unit, onNewFolder: (String) -> Unit, onAdded: (PokemonCardDto) -> Unit) {
+    val ctx = LocalContext.current; val owner = LocalLifecycleOwner.current; val scope = rememberCoroutineScope()
+    var perm by remember { mutableStateOf(ContextCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) }
+    val launch = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { perm = it }
+    LaunchedEffect(Unit) { if (!perm) launch.launch(Manifest.permission.CAMERA) }
 
-    var detectedText by remember { mutableStateOf("Наведите камеру на карту...") }
-    var foundCard by remember { mutableStateOf<PokemonCardDto?>(null) }
-    var isSearching by remember { mutableStateOf(false) }
-    var lastQuery by remember { mutableStateOf("") }
-    var lastQueryTime by remember { mutableLongStateOf(0L) }
-    var autoAddEnabled by remember { mutableStateOf(true) }
-    var lastAutoAddedId by remember { mutableStateOf("") }
-    var lastAutoAddedTime by remember { mutableLongStateOf(0L) }
-    var autoAddedBanner by remember { mutableStateOf<String?>(null) }
-    var showNewFolderDialog by remember { mutableStateOf(false) }
-    val currentFolderState by rememberUpdatedState(activeScanFolder)
-    val autoAddState by rememberUpdatedState(autoAddEnabled)
+    var status by remember { mutableStateOf("Наведите камеру на карту...") }
+    var found by remember { mutableStateOf<PokemonCardDto?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    var lastQ by remember { mutableStateOf("") }; var lastQT by remember { mutableLongStateOf(0L) }
+    var auto by remember { mutableStateOf(true) }
+    var lastId by remember { mutableStateOf("") }; var lastAddT by remember { mutableLongStateOf(0L) }
+    var banner by remember { mutableStateOf<String?>(null) }
+    var dlg by remember { mutableStateOf(false) }
+    val curFolder by rememberUpdatedState(activeFolder); val curAuto by rememberUpdatedState(auto)
 
-    fun vibrate() {
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                (context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator.vibrate(VibrationEffect.createOneShot(60, VibrationEffect.DEFAULT_AMPLITUDE))
-            } else {
-                @Suppress("DEPRECATION")
-                (context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator).vibrate(60)
-            }
-        } catch (_: Exception) {}
-    }
-
-    LaunchedEffect(autoAddedBanner) { if (autoAddedBanner != null) { delay(1600); autoAddedBanner = null } }
-    if (showNewFolderDialog) {
-        CreateFolderDialog({ showNewFolderDialog = false }) { name -> onCreateFolder(name); onSelectScanFolder(name.trim()); showNewFolderDialog = false }
-    }
-    if (!hasPermission) {
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Button({ launcher.launch(Manifest.permission.CAMERA) }) { Text("Разрешить камеру") } }
-        return
-    }
+    fun vib() { try { if (Build.VERSION.SDK_INT >= 31) (ctx.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator.vibrate(VibrationEffect.createOneShot(60, -1)) else @Suppress("DEPRECATION") (ctx.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator).vibrate(60) } catch (_: Exception) {} }
+    LaunchedEffect(banner) { if (banner != null) { delay(1600); banner = null } }
+    if (dlg) FolderDlg({ dlg = false }) { onNewFolder(it); onSelFolder(it.trim()); dlg = false }
+    if (!perm) { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Button({ launch.launch(Manifest.permission.CAMERA) }) { Text("Разрешить камеру") } }; return }
 
     Box(Modifier.fillMaxSize()) {
-        AndroidView(factory = { ctx ->
-            val previewView = PreviewView(ctx).apply { layoutParams = ViewGroup.LayoutParams(-1, -1) }
-            ProcessCameraProvider.getInstance(ctx).addListener({
-                val provider = ProcessCameraProvider.getInstance(ctx).get()
-                val preview = Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
-                val analyzer = ImageAnalysis.Builder().setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build()
-                val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-                var lastAnalyzed = 0L
-
-                analyzer.setAnalyzer(Executors.newSingleThreadExecutor()) { proxy ->
-                    val now = System.currentTimeMillis()
-                    if (now - lastAnalyzed < 450) { proxy.close(); return@setAnalyzer }
-                    @androidx.camera.core.ExperimentalGetImage
-                    val media = proxy.image
-                    if (media != null) {
-                        lastAnalyzed = now
-                        recognizer.process(InputImage.fromMediaImage(media, proxy.imageInfo.rotationDegrees))
-                            .addOnSuccessListener { vision ->
-                                val parsed = parseCardClean(vision)
-                                val t = System.currentTimeMillis()
-                                if (parsed != null && !isSearching && (parsed.primaryQuery != lastQuery || t - lastQueryTime > 2000)) {
-                                    lastQuery = parsed.primaryQuery; lastQueryTime = t; detectedText = "Ищу: ${parsed.displayLabel}"; isSearching = true
+        AndroidView(factory = { c ->
+            PreviewView(c).apply { layoutParams = ViewGroup.LayoutParams(-1, -1) }.also { pv ->
+                ProcessCameraProvider.getInstance(c).addListener({
+                    val prov = ProcessCameraProvider.getInstance(c).get()
+                    val prev = Preview.Builder().build().apply { setSurfaceProvider(pv.surfaceProvider) }
+                    val an = ImageAnalysis.Builder().setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build()
+                    val rec = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+                    var lastT = 0L
+                    an.setAnalyzer(Executors.newSingleThreadExecutor()) { px ->
+                        val now = System.currentTimeMillis()
+                        if (now - lastT < 450) { px.close(); return@setAnalyzer }
+                        @androidx.camera.core.ExperimentalGetImage val img = px.image
+                        if (img != null) {
+                            lastT = now
+                            rec.process(InputImage.fromMediaImage(img, px.imageInfo.rotationDegrees)).addOnSuccessListener { v ->
+                                val p = parseCardClean(v); val t = System.currentTimeMillis()
+                                if (p != null && !busy && (p.primaryQuery != lastQ || t - lastQT > 2000)) {
+                                    lastQ = p.primaryQuery; lastQT = t; status = "Ищу: ${p.displayLabel}"; busy = true
                                     scope.launch {
                                         try {
-                                            val card = ApiClient.cache[parsed.primaryQuery] ?: withContext(Dispatchers.IO) {
-                                                val res = ApiClient.api.searchCards(parsed.primaryQuery).data.firstOrNull()
-                                                    ?: parsed.fallbackQuery?.let { ApiClient.api.searchCards(it).data.firstOrNull() }
-                                                if (res != null) ApiClient.cache[parsed.primaryQuery] = res
-                                                res
+                                            val card = ApiClient.cache[p.primaryQuery] ?: withContext(Dispatchers.IO) {
+                                                (ApiClient.api.searchCards(p.primaryQuery).data.firstOrNull() ?: p.fallbackQuery?.let { ApiClient.api.searchCards(it).data.firstOrNull() })?.also { ApiClient.cache[p.primaryQuery] = it }
                                             }
                                             if (card != null) {
-                                                foundCard = card; detectedText = "Найдено: ${card.name} (#${card.number})"
-                                                if (autoAddState && parsed.hasExactNumber) {
-                                                    val addT = System.currentTimeMillis()
-                                                    if (card.id != lastAutoAddedId || addT - lastAutoAddedTime > 1500) {
-                                                        lastAutoAddedId = card.id; lastAutoAddedTime = addT; onCardAdded(card); vibrate()
-                                                        autoAddedBanner = "+1 ${card.name} →${currentFolderState ?: card.set.name}"
-                                                    }
+                                                found = card; status = "Найдено: ${card.name} (#${card.number})"
+                                                if (curAuto && p.hasExactNumber && (card.id != lastId || System.currentTimeMillis() - lastAddT > 1500)) {
+                                                    lastId = card.id; lastAddT = System.currentTimeMillis(); onAdded(card); vib(); banner = "+1 ${card.name} → ${curFolder ?: card.set.name}"
                                                 }
-                                            } else detectedText = "Не найдено: ${parsed.displayLabel}"
-                                        } catch (_: Exception) {} finally { isSearching = false }
+                                            } else status = "Не найдено: ${p.displayLabel}"
+                                        } catch (_: Exception) {} finally { busy = false }
                                     }
                                 }
-                            }.addOnCompleteListener { proxy.close() }
-                    } else proxy.close()
-                }
-                try { provider.unbindAll(); provider.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview, analyzer) } catch (_: Exception) {}
-            }, ContextCompat.getMainExecutor(ctx))
-            previewView
+                            }.addOnCompleteListener { px.close() }
+                        } else px.close()
+                    }
+                    try { prov.unbindAll(); prov.bindToLifecycle(owner, CameraSelector.DEFAULT_BACK_CAMERA, prev, an) } catch (_: Exception) {}
+                }, ContextCompat.getMainExecutor(c))
+            }
         }, modifier = Modifier.fillMaxSize())
 
         Column(Modifier.align(Alignment.TopCenter).fillMaxWidth().padding(14.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-            Surface(color = Color.Black.copy(alpha = 0.8f), shape = RoundedCornerShape(16.dp)) {
-                Column(Modifier.padding(horizontal = 14.dp, vertical = 8.dp)) {
+            Surface(color = Color.Black.copy(0.8f), shape = RoundedCornerShape(16.dp)) {
+                Column(Modifier.padding(14.dp, 8.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(detectedText, color = Color.White, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-                        Text(if (autoAddEnabled) "Авто: ВКЛ" else "Авто: ВЫКЛ", color = if (autoAddEnabled) Color(0xFF4CAF50) else Color.LightGray, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                        Spacer(Modifier.width(6.dp))
-                        Switch(checked = autoAddEnabled, onCheckedChange = { autoAddEnabled = it })
+                        Text(status, color = Color.White, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                        Text(if (auto) "Авто: ВКЛ" else "Авто: ВЫКЛ", color = if (auto) Color(0xFF4CAF50) else Color.LightGray, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        Spacer(Modifier.width(6.dp)); Switch(auto, { auto = it })
                     }
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        item { FilterChip(selected = activeScanFolder == null, onClick = { onSelectScanFolder(null) }, label = { Text("Родной сет", fontSize = 11.sp) }) }
-                        items(customFolders) { f -> FilterChip(selected = activeScanFolder == f, onClick = { onSelectScanFolder(f) }, label = { Text(f, fontSize = 11.sp) }) }
-                        item { AssistChip(onClick = { showNewFolderDialog = true }, label = { Text("+ Папка", fontSize = 11.sp) }) }
+                        item { FilterChip(activeFolder == null, { onSelFolder(null) }, { Text("Родной сет", fontSize = 11.sp) }) }
+                        items(folders) { f -> FilterChip(activeFolder == f, { onSelFolder(f) }, { Text(f, fontSize = 11.sp) }) }
+                        item { AssistChip({ dlg = true }, { Text("+ Папка", fontSize = 11.sp) }) }
                     }
                 }
             }
-            autoAddedBanner?.let {
-                Spacer(Modifier.height(8.dp))
-                Surface(color = Color(0xFF2E7D32), shape = RoundedCornerShape(20.dp)) {
-                    Text(it, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
-                }
-            }
+            banner?.let { Spacer(Modifier.height(8.dp)); Surface(color = Color(0xFF2E7D32), shape = RoundedCornerShape(20.dp)) { Text(it, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp, modifier = Modifier.padding(16.dp, 8.dp)) } }
         }
 
-        foundCard?.let { card ->
+        found?.let { c ->
             Card(Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(16.dp), shape = RoundedCornerShape(16.dp)) {
                 Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                    AsyncImage(model = card.images.small, contentDescription = card.name, modifier = Modifier.size(72.dp, 100.dp).clip(RoundedCornerShape(8.dp)))
+                    AsyncImage(c.images.small, c.name, Modifier.size(72.dp, 100.dp).clip(RoundedCornerShape(8.dp)))
                     Spacer(Modifier.width(12.dp))
                     Column(Modifier.weight(1f)) {
-                        Text(card.name, fontWeight = FontWeight.Bold, fontSize = 18.sp)
-                        Text("В папку: ${activeScanFolder ?: card.set.name} • #${card.number}", fontSize = 12.sp, color = Color.Gray)
+                        Text(c.name, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                        Text("В папку: ${activeFolder ?: c.set.name} • #${c.number}", fontSize = 12.sp, color = Color.Gray)
                         Spacer(Modifier.height(8.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Button(onClick = { onCardAdded(card); vibrate(); autoAddedBanner = "+1 ${card.name} →${activeScanFolder ?: card.set.name}" }, modifier = Modifier.weight(1f)) { Text("+1 в папку") }
-                            OutlinedButton(onClick = { foundCard = null; lastQuery = ""; detectedText = "Наведите камеру..." }) { Text("Сброс") }
+                            Button({ onAdded(c); vib(); banner = "+1 ${c.name} → ${activeFolder ?: c.set.name}" }, Modifier.weight(1f)) { Text("+1 в папку") }
+                            OutlinedButton({ found = null; lastQ = ""; status = "Наведите камеру..." }) { Text("Сброс") }
                         }
                     }
                 }
@@ -310,12 +236,85 @@ fun ScannerScreen(
     }
 }
 
-fun parseCardClean(visionText: Text): ParsedCardInfo? {
-    val rawText = visionText.text
-    if (rawText.isBlank()) return null
-    val numMatch = Regex("""\b([A-Za-z]{0,3}\d{1,3})\s*/\s*[A-Za-z]{0,3}\d{1,3}\b""").find(rawText)
-    val rawNum = numMatch?.groupValues?.get(1)
-    val cleanNumber = rawNum?.let { if (it.all { c -> c.isDigit() }) it.trimStart('0').ifEmpty { "0" } else it }
+fun parseCardClean(vt: Text): ParsedCardInfo? {
+    val raw = vt.text; if (raw.isBlank()) return null
+    val num = Regex("""\b([A-Za-z]{0,3}\d{1,3})\s*/\s*[A-Za-z]{0,3}\d{1,3}\b""").find(raw)?.groupValues?.get(1)?.let { if (it.all { c -> c.isDigit() }) it.trimStart('0').ifEmpty { "0" } else it }
+    val lines = vt.textBlocks.sortedBy { it.boundingBox?.top ?: Int.MAX_VALUE }.flatMap { it.lines }.sortedBy { it.boundingBox?.top ?: Int.MAX_VALUE }
+    val bad = Regex("""^(STAGE\s*\d*|STAG\w*|GTAG\w*|BASIC|BASI\w*|VMAX|VSTAR|TRAINER|SUPPORTER|ITEM|STADIUM|ENERGY)\s+""", RegexOption.IGNORE_CASE)
+    val noise = setOf("BASIC", "STAGE", "STAGE 1", "STAGE 2", "VMAX", "VSTAR", "TRAINER", "SUPPORTER", "ITEM", "STADIUM", "ENERGY")
+    var name: String? = null
+    for (l in lines.take(8)) {
+        var t = l.text.trim().replace(bad, "").replace(Regex("""\bHP\s*\d+\b|\b\d+\s*HP\b""", RegexOption.IGNORE_CASE), "").replace(Regex("""[^a-zA-Z0-9\s.'-]"""), "").trim()
+        val w = t.split(Regex("""\s+"""))
+        if (w.size >= 2 && w[0].length in 4..6 && w[0].all { it.isUpperCase() } && w[1][0].isUpperCase() && w[1].drop(1).any { it.isLowerCase() }) t = w.drop(1).joinToString(" ")
+        val u = t.uppercase()
+        if (t.length in 3..26 && !noise.contains(u) && !u.startsWith("EVOLVES") && !u.startsWith("STAG") && !u.startsWith("GTAG") && t.any { it.isLetter() }) { name = t; break }
+    }
+    val n = name ?: return null
+    return if (num != null) ParsedCardInfo("name:\"$n\" number:$num", "name:\"$n\"", "$n #$num", true) else ParsedCardInfo("name:\"$n\"", null, n, false)
+}
 
-    val allLines = visionText.textBlocks.sortedBy { it.boundingBox?.top ?: Int.MAX_VALUE }.flatMap { it.lines }.sortedBy { it.boundingBox?.top ?: Int.MAX_VALUE }
-    val badPrefixes = Regex("""^(STAGE\s
+@Composable
+fun FolderDlg(onDim: () -> Unit, onOk: (String) -> Unit) {
+    var n by remember { mutableStateOf("") }
+    AlertDialog(onDismissRequest = onDim, title = { Text("Новая папка") }, text = { OutlinedTextField(n, { n = it }, placeholder = { Text("Название...") }, singleLine = true, modifier = Modifier.fillMaxWidth()) },
+        confirmButton = { Button({ onOk(n) }, enabled = n.trim().isNotEmpty()) { Text("Создать") } }, dismissButton = { TextButton(onDim) { Text("Отмена") } })
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun CollectionScreen(cards: List<CollectedCard>, folders: List<String>, onNewF: (String) -> Unit, onDelF: (String) -> Unit, onMove: (String, String) -> Unit, onInc: (String) -> Unit, onDec: (String) -> Unit) {
+    val ctx = LocalContext.current
+    var q by remember { mutableStateOf("") }; var set by remember { mutableStateOf("Все") }
+    var dlg by remember { mutableStateOf(false) }; var mov by remember { mutableStateOf<CollectedCard?>(null) }
+    val sets = remember(cards, folders) { listOf("Все") + (folders + cards.map { it.setName }).distinct().sorted() }
+    LaunchedEffect(sets) { if (!sets.contains(set)) set = "Все" }
+    val list = remember(cards, q, set) { cards.filter { (set == "Все" || it.setName == set) && (q.isBlank() || it.name.contains(q, true) || it.number.contains(q, true) || it.setName.contains(q, true)) } }
+
+    if (dlg) FolderDlg({ dlg = false }) { onNewF(it); set = it.trim(); dlg = false }
+    mov?.let { c ->
+        val all = (folders + cards.map { it.setName }).distinct().sorted()
+        AlertDialog(onDismissRequest = { mov = null }, title = { Text("В папку:") }, text = { Column { all.forEach { f -> TextButton({ onMove(c.id, f); mov = null }) { Text(f) } } } },
+            confirmButton = { TextButton({ mov = null; dlg = true }) { Text("+ Новая") } }, dismissButton = { TextButton({ mov = null }) { Text("Закрыть") } })
+    }
+
+    Column(Modifier.fillMaxSize().padding(16.dp)) {
+        Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
+            Column { Text("Моя коллекция", fontSize = 22.sp, fontWeight = FontWeight.Bold); Text("Карт: ${list.sumOf { it.count }} (${list.size} уник.)", color = Color.Gray, fontSize = 13.sp) }
+            Row {
+                IconButton({ dlg = true }) { Icon(Icons.Default.CreateNewFolder, null) }
+                IconButton({ ctx.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply { putExtra(Intent.EXTRA_TEXT, list.joinToString("\n") { "${it.count}x ${it.name} (${it.setName} #${it.number})" }); type = "text/plain" }, "Экспорт")) }, enabled = list.isNotEmpty()) { Icon(Icons.Default.Share, null) }
+            }
+        }
+        Spacer(Modifier.height(8.dp)); OutlinedTextField(q, { q = it }, Modifier.fillMaxWidth(), placeholder = { Text("Поиск...") }, singleLine = true); Spacer(Modifier.height(8.dp))
+        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            items(sets) { s ->
+                val cnt = if (s == "Все") cards.sumOf { it.count } else cards.filter { it.setName == s }.sumOf { it.count }
+                FilterChip(set == s, { set = s }, { Text("$s ($cnt)") }, trailingIcon = if (folders.contains(s) && cnt == 0) { { Icon(Icons.Default.Close, null, Modifier.size(16.dp).clickable { onDelF(s) }) } } else null)
+            }
+            item { AssistChip({ dlg = true }, { Text("+ Папка") }) }
+        }
+        Spacer(Modifier.height(10.dp))
+        if (list.isEmpty()) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Пусто", color = Color.Gray) }
+        else LazyVerticalGrid(GridCells.Fixed(2), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            items(list, key = { it.id }) { c ->
+                Card(shape = RoundedCornerShape(12.dp)) {
+                    Column(Modifier.padding(8.dp)) {
+                        Box {
+                            AsyncImage(c.imageUrl, c.name, contentScale = ContentScale.FillWidth, modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)))
+                            Box(Modifier.align(Alignment.TopEnd).padding(6.dp).background(MaterialTheme.colorScheme.primary, CircleShape).padding(8.dp, 4.dp)) { Text("x${c.count}", color = MaterialTheme.colorScheme.onPrimary, fontWeight = FontWeight.Bold, fontSize = 12.sp) }
+                        }
+                        Spacer(Modifier.height(6.dp)); Text(c.name, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text("${c.setName} #${c.number}", fontSize = 11.sp, color = Color.Gray, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.clickable { mov = c })
+                        Spacer(Modifier.height(4.dp))
+                        Row(Modifier.fillMaxWidth(), Arrangement.SpaceEvenly, Alignment.CenterVertically) {
+                            FilledTonalIconButton({ onDec(c.id) }, Modifier.size(32.dp)) { Icon(Icons.Default.Remove, null, Modifier.size(16.dp)) }
+                            Text("${c.count}", fontWeight = FontWeight.Bold)
+                            FilledTonalIconButton({ onInc(c.id) }, Modifier.size(32.dp)) { Icon(Icons.Default.Add, null, Modifier.size(16.dp)) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
