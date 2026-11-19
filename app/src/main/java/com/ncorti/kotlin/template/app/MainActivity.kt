@@ -4,7 +4,6 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.Rect
 import android.media.AudioManager
 import android.media.ToneGenerator
 import android.os.Build
@@ -21,7 +20,6 @@ import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyRow
@@ -146,7 +144,7 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
     val launch = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { perm = it }
     LaunchedEffect(Unit) { if (!perm) launch.launch(Manifest.permission.CAMERA) }
 
-    var status by remember { mutableStateOf("Положите карту в рамку...") }
+    var status by remember { mutableStateOf("Жду карту...") }
     var found by remember { mutableStateOf<PokemonCardDto?>(null) }
     var busy by remember { mutableStateOf(false) }
     var lastQ by remember { mutableStateOf("") }; var lastQT by remember { mutableLongStateOf(0L) }
@@ -193,21 +191,19 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
                             lastT = now
                             val rot = (px.imageInfo.rotationDegrees + curExtraRot) % 360
                             val inImg = InputImage.fromMediaImage(img, rot)
-                            val w = inImg.width; val h = inImg.height
-                            val roi = Rect((w * 0.16f).toInt(), (h * 0.18f).toInt(), (w * 0.84f).toInt(), (h * 0.82f).toInt())
                             rec.process(inImg).addOnSuccessListener { v ->
                                 val isManual = manualTrigger
-                                val p = parseCardClean(v, roi); val t = System.currentTimeMillis()
+                                val p = parseCardClean(v); val t = System.currentTimeMillis()
                                 if (p == null) {
                                     if (isManual) {
                                         manualTrigger = false
-                                        status = "В рамке не видно текста карты"
+                                        status = "Текст карты не виден"
                                     }
                                     emptyFrames++
                                     if (emptyFrames >= 3 && locked) {
                                         locked = false
                                         lastQ = ""
-                                        if (!busy) status = "Рамка пуста — жду карту..."
+                                        if (!busy) status = "Готов к следующей карте..."
                                     }
                                     return@addOnSuccessListener
                                 }
@@ -227,7 +223,7 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
                                                 if (isManual || (curAuto && p.hasExactNumber && !locked)) {
                                                     locked = true
                                                     onAdded(card); beepAndVib()
-                                                    status = "ГОТОВО: ${card.name} → скидывайте в лоток"
+                                                    status = "ГОТОВО: ${card.name} (уберите карту)"
                                                     banner = "+1 ${card.name} → ${curFolder ?: card.set.name}"
                                                 } else {
                                                     status = "Найдено: ${card.name} (${card.set.name} #${card.number})"
@@ -247,53 +243,6 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
             }
         }, modifier = Modifier.fillMaxSize())
 
-        // Визуальная рамка прицела + кнопка ручного фото
-        Column(
-            Modifier.align(Alignment.Center),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Box(
-                Modifier
-                    .fillMaxWidth(0.72f)
-                    .fillMaxHeight(0.50f)
-                    .border(
-                        width = if (locked) 4.dp else 2.dp,
-                        color = if (locked) Color(0xFF4CAF50) else Color(0xFFFFD54F).copy(alpha = 0.85f),
-                        shape = RoundedCornerShape(16.dp)
-                    )
-            ) {
-                Text(
-                    text = if (locked) "СЧИТАНО • СКИДЫВАЙ" else "ЗОНА СКАНА (${extraRot}°)",
-                    color = if (locked) Color(0xFF4CAF50) else Color(0xFFFFD54F),
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier
-                        .align(Alignment.TopCenter)
-                        .padding(top = 6.dp)
-                        .background(Color.Black.copy(0.65f), RoundedCornerShape(6.dp))
-                        .padding(8.dp, 2.dp)
-                )
-            }
-            Spacer(Modifier.height(10.dp))
-            FilledTonalButton(
-                onClick = {
-                    locked = false
-                    lastQ = ""
-                    manualTrigger = true
-                    status = "Ручной снимок..."
-                },
-                shape = CircleShape,
-                colors = ButtonDefaults.filledTonalButtonColors(
-                    containerColor = Color.Black.copy(0.82f),
-                    contentColor = Color.White
-                )
-            ) {
-                Icon(Icons.Default.PhotoCamera, null, modifier = Modifier.size(20.dp))
-                Spacer(Modifier.width(8.dp))
-                Text("Скан сейчас", fontWeight = FontWeight.Bold, fontSize = 13.sp)
-            }
-        }
-
         Column(Modifier.align(Alignment.TopCenter).fillMaxWidth().padding(12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
             Surface(color = Color.Black.copy(0.82f), shape = RoundedCornerShape(16.dp)) {
                 Column(Modifier.padding(12.dp, 8.dp)) {
@@ -302,7 +251,7 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
                         IconButton({ torch = !torch }, Modifier.size(32.dp)) {
                             Icon(if (torch) Icons.Default.FlashOn else Icons.Default.FlashOff, null, tint = if (torch) Color(0xFFFFD54F) else Color.White, modifier = Modifier.size(18.dp))
                         }
-                        IconButton({ extraRot = (extraRot + 90) % 360; lastQ = ""; locked = false }, Modifier.size(32.dp)) {
+                        IconButton({ extraRot = (extraRot + 90) % 360; lastQ = ""; locked = false; status = "Поворот: $extraRot°" }, Modifier.size(32.dp)) {
                             Icon(Icons.Default.RotateRight, null, tint = Color.White, modifier = Modifier.size(18.dp))
                         }
                         Switch(auto, { auto = it; if (!it) locked = false })
@@ -317,18 +266,42 @@ fun ScannerScreen(folders: List<String>, activeFolder: String?, onSelFolder: (St
             banner?.let { Spacer(Modifier.height(6.dp)); Surface(color = Color(0xFF2E7D32), shape = RoundedCornerShape(20.dp)) { Text(it, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp, modifier = Modifier.padding(16.dp, 6.dp)) } }
         }
 
-        found?.let { c ->
-            Card(Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(14.dp), shape = RoundedCornerShape(16.dp)) {
-                Row(Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
-                    AsyncImage(c.images.small, c.name, Modifier.size(60.dp, 84.dp).clip(RoundedCornerShape(8.dp)))
-                    Spacer(Modifier.width(10.dp))
-                    Column(Modifier.weight(1f)) {
-                        Text(c.name, fontWeight = FontWeight.Bold, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Text("${activeFolder ?: c.set.name} • #${c.number}", fontSize = 12.sp, color = Color.Gray, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Spacer(Modifier.height(6.dp))
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Button({ onAdded(c); beepAndVib(); banner = "+1 ${c.name} → ${activeFolder ?: c.set.name}" }, Modifier.weight(1f)) { Text("+1", fontSize = 12.sp) }
-                            OutlinedButton({ found = null; lastQ = ""; locked = false; status = "Положите карту в рамку..." }) { Text("Сброс", fontSize = 12.sp) }
+        Column(
+            Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(14.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            FilledTonalButton(
+                onClick = {
+                    locked = false
+                    lastQ = ""
+                    manualTrigger = true
+                    status = "Ручной снимок..."
+                },
+                shape = CircleShape,
+                colors = ButtonDefaults.filledTonalButtonColors(
+                    containerColor = Color.Black.copy(0.85f),
+                    contentColor = Color.White
+                )
+            ) {
+                Icon(Icons.Default.PhotoCamera, null, modifier = Modifier.size(20.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Скан сейчас", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+            }
+
+            found?.let { c ->
+                Spacer(Modifier.height(10.dp))
+                Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)) {
+                    Row(Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                        AsyncImage(c.images.small, c.name, Modifier.size(60.dp, 84.dp).clip(RoundedCornerShape(8.dp)))
+                        Spacer(Modifier.width(10.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(c.name, fontWeight = FontWeight.Bold, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text("${activeFolder ?: c.set.name} • #${c.number}", fontSize = 12.sp, color = Color.Gray, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Spacer(Modifier.height(6.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Button({ onAdded(c); beepAndVib(); banner = "+1 ${c.name} → ${activeFolder ?: c.set.name}" }, Modifier.weight(1f)) { Text("+1", fontSize = 12.sp) }
+                                OutlinedButton({ found = null; lastQ = ""; locked = false; status = "Жду карту..." }) { Text("Сброс", fontSize = 12.sp) }
+                            }
                         }
                     }
                 }
@@ -349,22 +322,12 @@ fun fixOcrDigits(s: String): String = s.map {
     }
 }.joinToString("")
 
-fun parseCardClean(vt: Text, roi: Rect): ParsedCardInfo? {
-    val roiLines = vt.textBlocks
-        .flatMap { it.lines }
-        .filter { line ->
-            val b = line.boundingBox ?: return@filter false
-            roi.contains(b.centerX(), b.centerY())
-        }
-        .sortedBy { it.boundingBox?.top ?: Int.MAX_VALUE }
-
-    if (roiLines.isEmpty()) return null
-    val rawRoi = roiLines.joinToString("\n") { it.text }
-
+fun parseCardClean(vt: Text): ParsedCardInfo? {
+    val raw = vt.text; if (raw.isBlank()) return null
     var num: String? = null
     var total: String? = null
 
-    val slashMatch = Regex("""\b([A-Za-z0-9|]{1,5})\s*/\s*([A-Za-z0-9|]{2,4})\b""").find(rawRoi)
+    val slashMatch = Regex("""\b([A-Za-z0-9|]{1,5})\s*/\s*([A-Za-z0-9|]{2,4})\b""").find(raw)
     if (slashMatch != null) {
         val leftRaw = slashMatch.groupValues[1]
         val rightFixed = fixOcrDigits(slashMatch.groupValues[2])
@@ -380,10 +343,11 @@ fun parseCardClean(vt: Text, roi: Rect): ParsedCardInfo? {
         if (totDigits.isNotEmpty() && totDigits.toIntOrNull() in 10..400) total = totDigits
     }
 
+    val lines = vt.textBlocks.sortedBy { it.boundingBox?.top ?: Int.MAX_VALUE }.flatMap { it.lines }.sortedBy { it.boundingBox?.top ?: Int.MAX_VALUE }
     val badPrefix = Regex("""^(STAGE\s*\d*|STAG\w*|GTAG\w*|BASIC|BASI\w*|VMAX|VSTAR|TRAINER|SUPPORTER|ITEM|STADIUM|ENERGY)\s+""", RegexOption.IGNORE_CASE)
     val noise = setOf("BASIC", "STAGE", "STAGE 1", "STAGE 2", "VMAX", "VSTAR", "TRAINER", "SUPPORTER", "ITEM", "STADIUM", "ENERGY")
     var name: String? = null
-    for (l in roiLines.take(8)) {
+    for (l in lines.take(8)) {
         var t = l.text.trim()
             .replace(badPrefix, "")
             .replace(Regex("""\bHP\s*\d+\b|\b\d+\s*HP\b""", RegexOption.IGNORE_CASE), "")
