@@ -14,6 +14,7 @@ import android.os.Bundle
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
+import android.util.Size as AndroidSize
 import android.view.ViewGroup
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -22,6 +23,8 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.*
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.BorderStroke
@@ -243,6 +246,43 @@ object TcgDexRepository {
         }
     }
 
+    suspend fun downloadFullDatabase(
+        allSets: List<TcgSet>,
+        existingSlots: Map<String, List<CardSlot>>,
+        onProgress: (done: Int, total: Int, updatedMap: Map<String, List<CardSlot>>) -> Unit
+    ) = withContext(Dispatchers.IO) {
+        val missingSets = allSets.filter { !existingSlots.containsKey(it.id) || existingSlots[it.id].isNullOrEmpty() }
+        if (missingSets.isEmpty()) return@withContext
+
+        var currentMap = existingSlots
+        var completed = allSets.size - missingSets.size
+        val total = allSets.size
+        val sem = Semaphore(6)
+
+        missingSets.chunked(12).forEach { batch ->
+            val fetched = coroutineScope {
+                batch.map { set ->
+                    async {
+                        sem.withPermit {
+                            try {
+                                set.id to fetchSetSlots(set)
+                            } catch (_: Exception) {
+                                null
+                            }
+                        }
+                    }
+                }.awaitAll().filterNotNull()
+            }
+            if (fetched.isNotEmpty()) {
+                currentMap = currentMap + fetched.toMap()
+            }
+            completed += batch.size
+            withContext(Dispatchers.Main) {
+                onProgress(completed.coerceAtMost(total), total, currentMap)
+            }
+        }
+    }
+
     suspend fun searchGlobalCards(query: String, setsMap: Map<String, TcgSet>): List<CardSlot> = withContext(Dispatchers.IO) {
         val encoded = URLEncoder.encode(query.trim(), "UTF-8")
         val req = Request.Builder().url("https://api.tcgdex.net/v2/en/cards?name=$encoded").build()
@@ -425,7 +465,6 @@ object CardRecognizer {
 
         val uniqueCards = candidateSlots.distinctBy { it.cardId }
 
-        // Глобальный режим: строго требуется "/TTT" и совпадение setTotal
         if (!isScopedSet) {
             if (parsedLocalNum == null || parsedSetTotal == null) return null
             val matching = uniqueCards.filter { card ->
@@ -445,7 +484,6 @@ object CardRecognizer {
             }
         }
 
-        // Режим внутри сета
         if (parsedLocalNum != null) {
             val numCandidates = uniqueCards.filter { card ->
                 val cNum = card.localId.filter { it.isDigit() }.trimStart('0').ifEmpty { "0" }
@@ -468,7 +506,6 @@ object CardRecognizer {
             return CardMatchResult(sorted.first(), needsCheck = true)
         }
 
-        // Номер не прочитан, пробуем только по имени внутри сета
         if (hasNameText) {
             val nameCandidates = uniqueCards
                 .filter { nameMatches(it.name, topNameText) }
@@ -634,9 +671,15 @@ fun PokemonCatalogApp() {
         }
         ScannerOverlayScreen(
             scopeSet = scannerScopeSet,
+            allSets = sets,
+            slotsBySet = slotsBySet,
             candidateSlots = scopedSlots,
             quantities = quantities,
             hashes = hashes,
+            onFullDatabaseUpdated = { updatedMap ->
+                slotsBySet = updatedMap
+                store.saveAllSlots(updatedMap)
+            },
             onIncrementSlot = { slotId -> changeQty(slotId, 1) },
             onClose = { isScannerOpen = false }
         )
@@ -1337,9 +1380,12 @@ fun extractCardCropBitmap(imageProxy: ImageProxy, extraRotationDegrees: Int): Bi
 @Composable
 fun ScannerOverlayScreen(
     scopeSet: TcgSet?,
+    allSets: List<TcgSet>,
+    slotsBySet: Map<String, List<CardSlot>>,
     candidateSlots: List<CardSlot>,
     quantities: Map<String, Int>,
     hashes: Map<String, CardHashEntry>,
+    onFullDatabaseUpdated: (Map<String, List<CardSlot>>) -> Unit,
     onIncrementSlot: (String) -> Unit,
     onClose: () -> Unit
 ) {
@@ -1372,6 +1418,10 @@ fun ScannerOverlayScreen(
     var selectedBatchFinish by remember { mutableStateOf("Normal") }
     var pendingBatch by remember { mutableStateOf<List<PendingScanItem>>(emptyList()) }
     var uidCounter by remember { mutableLongStateOf(1L) }
+
+    var isDownloadingDb by remember { mutableStateOf(false) }
+    var dbDownloadProgress by remember { mutableStateOf("") }
+    var debugOcrLine by remember { mutableStateOf("OCR: ожидание кадра...") }
 
     var statusText by remember {
         mutableStateOf(
@@ -1443,7 +1493,18 @@ fun ScannerOverlayScreen(
                     val prov = ProcessCameraProvider.getInstance(c).get()
                     cameraProviderRef = prov
                     val prev = Preview.Builder().build().apply { setSurfaceProvider(pv.surfaceProvider) }
+
+                    val resSel = ResolutionSelector.Builder()
+                        .setResolutionStrategy(
+                            ResolutionStrategy(
+                                AndroidSize(1920, 1080),
+                                ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                            )
+                        )
+                        .build()
+
                     val an = ImageAnalysis.Builder()
+                        .setResolutionSelector(resSel)
                         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                         .build()
                     var lastT = 0L
@@ -1483,6 +1544,32 @@ fun ScannerOverlayScreen(
                                 val botText = if (botTask.isSuccessful) botTask.result?.text ?: "" else ""
                                 topCrop.recycle()
                                 botLeftCrop.recycle()
+
+                                val numRaw = botText.replace('O', '0').replace('o', '0').replace('I', '1').replace('l', '1')
+                                val slashMatch = Regex("""\b(\d{1,3})\s*/\s*(\d{2,3})\b""").find(numRaw)
+                                val parsedNumDebug = if (slashMatch != null) {
+                                    "${slashMatch.groupValues[1]}/${slashMatch.groupValues[2]}"
+                                } else {
+                                    Regex("""\b(\d{1,3})\b""").find(numRaw)?.groupValues?.get(1) ?: "нет"
+                                }
+
+                                val uniqueCards = curSlots.distinctBy { it.cardId }
+                                val cleanLocal = parsedNumDebug.substringBefore("/").trimStart('0').ifEmpty { "0" }
+                                val cleanTotal = parsedNumDebug.substringAfter("/", "").toIntOrNull()
+                                val matchingCount = if (parsedNumDebug == "нет") 0 else uniqueCards.count { card ->
+                                    val cNum = card.localId.filter { it.isDigit() }.trimStart('0').ifEmpty { "0" }
+                                    if (curScopeSet != null) {
+                                        cNum == cleanLocal
+                                    } else {
+                                        cNum == cleanLocal && cleanTotal != null && card.setTotal == cleanTotal
+                                    }
+                                }
+
+                                val rawBotClean = botText.replace('\n', ' ').trim().ifEmpty { "пусто" }
+                                val rawTopClean = topText.replace('\n', ' ').trim().take(18).ifEmpty { "пусто" }
+                                scope.launch(Dispatchers.Main) {
+                                    debugOcrLine = "OCR[$cw×$ch]: низ=\"$rawBotClean\" | верх=\"$rawTopClean\" | Num=$parsedNumDebug | Канд=$matchingCount/${uniqueCards.size}"
+                                }
 
                                 val isFrameEmpty = topText.isBlank() && botText.isBlank()
                                 if (isFrameEmpty) {
@@ -1636,7 +1723,7 @@ fun ScannerOverlayScreen(
                         }
                         Column(Modifier.weight(1f).padding(horizontal = 4.dp)) {
                             Text(
-                                text = scopeSet?.name ?: "Все сеты (нужен номер XXX/YYY)",
+                                text = scopeSet?.name ?: "Все сеты (${candidateSlots.distinctBy { it.cardId }.size} карт)",
                                 color = AccentTeal,
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold,
@@ -1669,6 +1756,51 @@ fun ScannerOverlayScreen(
                         }
                     }
 
+                    if (scopeSet == null && slotsBySet.size < allSets.size) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 4.dp, vertical = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Button(
+                                onClick = {
+                                    if (!isDownloadingDb) {
+                                        isDownloadingDb = true
+                                        dbDownloadProgress = "Загрузка: ${slotsBySet.size}/${allSets.size} сетов..."
+                                        scope.launch {
+                                            try {
+                                                TcgDexRepository.downloadFullDatabase(
+                                                    allSets = allSets,
+                                                    existingSlots = slotsBySet
+                                                ) { done, total, updatedMap ->
+                                                    onFullDatabaseUpdated(updatedMap)
+                                                    dbDownloadProgress = "Загрузка: $done/$total сетов..."
+                                                }
+                                                statusText = "База загружена (${allSets.size} сетов)"
+                                            } finally {
+                                                isDownloadingDb = false
+                                                dbDownloadProgress = ""
+                                            }
+                                        }
+                                    }
+                                },
+                                enabled = !isDownloadingDb,
+                                colors = ButtonDefaults.buttonColors(containerColor = AccentTeal),
+                                shape = RoundedCornerShape(10.dp),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                modifier = Modifier.fillMaxWidth().height(34.dp)
+                            ) {
+                                Text(
+                                    text = if (isDownloadingDb) dbDownloadProgress else "Скачать базу (${slotsBySet.size}/${allSets.size} сетов)",
+                                    color = Color.Black,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 11.sp
+                                )
+                            }
+                        }
+                    }
+
                     Row(
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -1686,6 +1818,15 @@ fun ScannerOverlayScreen(
                             )
                         }
                     }
+
+                    Text(
+                        text = debugOcrLine,
+                        color = Color(0xFFFFD54F),
+                        fontSize = 10.sp,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 2.dp)
+                    )
                 }
             }
 
