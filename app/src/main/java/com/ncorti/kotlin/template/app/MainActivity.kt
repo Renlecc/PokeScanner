@@ -37,6 +37,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -147,7 +148,11 @@ object TcgDexRepository {
                     list.add(TcgSet(id, name, logoUrl, releaseDate, total))
                 }
             }
-            list.sortedByDescending { it.releaseDate ?: "" }
+            // Сеты с датой выхода сортируем от самых новых к старым, промо без даты отправляем в конец
+            list.sortedWith(
+                compareBy<TcgSet> { it.releaseDate.isNullOrBlank() }
+                    .thenByDescending { it.releaseDate ?: "" }
+            )
         }
     }
 
@@ -172,17 +177,29 @@ object TcgDexRepository {
                 val imageUrl = "$imgBase/low.webp"
                 val rarity = obj.get("rarity")?.takeIf { !it.isJsonNull }?.asString ?: "Common"
 
-                val variantsObj = obj.getAsJsonObject("variants")
-                val finishes = mutableListOf<String>()
-                if (variantsObj != null) {
-                    if (variantsObj.get("normal")?.takeIf { !it.isJsonNull }?.asBoolean == true) finishes.add("Normal")
-                    if (variantsObj.get("reverse")?.takeIf { !it.isJsonNull }?.asBoolean == true) finishes.add("Reverse Holofoil")
-                    if (variantsObj.get("holo")?.takeIf { !it.isJsonNull }?.asBoolean == true) finishes.add("Holofoil")
-                }
-                if (finishes.isEmpty()) {
-                    val rLow = rarity.lowercase()
-                    if (rLow.contains("rare") && rLow != "rare") finishes.add("Holofoil")
-                    else finishes.add("Normal")
+                val numVal = localId.filter { it.isDigit() }.toIntOrNull() ?: 0
+                val rLow = rarity.lowercase()
+                val nameLow = cname.lowercase()
+
+                // Определяем, ультра-редкая ли это карта (1 слот Holofoil) или обычная/редкая (2 слота: основная + Reverse Holofoil)
+                val isUltraOrSecret = (officialTotal > 0 && numVal > officialTotal) ||
+                    rLow.contains("ultra") ||
+                    rLow.contains("illustration") ||
+                    rLow.contains("hyper") ||
+                    rLow.contains("secret") ||
+                    rLow.contains("double rare") ||
+                    rLow.contains("shiny") ||
+                    rLow.contains("ace spec") ||
+                    nameLow.endsWith(" ex") ||
+                    nameLow.endsWith(" vmax") ||
+                    nameLow.endsWith(" vstar") ||
+                    nameLow.endsWith(" gx") ||
+                    nameLow.endsWith(" v")
+
+                val finishes = when {
+                    isUltraOrSecret -> listOf("Holofoil")
+                    rLow == "rare holo" || rLow == "holo rare" -> listOf("Holofoil", "Reverse Holofoil")
+                    else -> listOf("Normal", "Reverse Holofoil")
                 }
 
                 for (fin in finishes) {
@@ -210,10 +227,10 @@ object TcgDexRepository {
 // --- Local Storage ---
 class LocalStore(ctx: Context) {
     private val gson = Gson()
-    private val qtyFile = File(ctx.filesDir, "tcg_quantities_v1.json")
-    private val setsFile = File(ctx.filesDir, "tcg_sets_v1.json")
-    private val slotsFile = File(ctx.filesDir, "tcg_slots_v1.json")
-    private val hashFile = File(ctx.filesDir, "tcg_hashes_v1.json")
+    private val qtyFile = File(ctx.filesDir, "tcg_quantities_v2.json")
+    private val setsFile = File(ctx.filesDir, "tcg_sets_v2.json")
+    private val slotsFile = File(ctx.filesDir, "tcg_slots_v2.json")
+    private val hashFile = File(ctx.filesDir, "tcg_hashes_v2.json")
 
     private inline fun <reified T> readJson(file: File, fallback: T): T {
         return try {
@@ -508,10 +525,17 @@ fun SetsCatalogScreen(
     var query by remember { mutableStateOf("") }
     var searchAllCardsMode by remember { mutableStateOf(false) }
 
-    val filteredSets = remember(sets, query) {
-        if (query.isBlank()) sets
-        else sets.filter {
-            it.name.contains(query, ignoreCase = true) || it.id.contains(query, ignoreCase = true)
+    // По умолчанию показываем только начатые сеты (куда добавлены карты); при поиске показываем все подходящие из памяти
+    val displayedSets = remember(sets, slotsBySet, quantities, query) {
+        if (query.isNotBlank()) {
+            sets.filter {
+                it.name.contains(query, ignoreCase = true) || it.id.contains(query, ignoreCase = true)
+            }
+        } else {
+            sets.filter { set ->
+                val setSlots = slotsBySet[set.id] ?: return@filter false
+                setSlots.any { (quantities[it.slotId] ?: 0) > 0 }
+            }
         }
     }
 
@@ -522,7 +546,14 @@ fun SetsCatalogScreen(
         }.take(80)
     }
 
-    Column(Modifier.fillMaxSize().background(BgBlack).padding(horizontal = 14.dp, vertical = 10.dp)) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(BgBlack)
+            .statusBarsPadding()
+            .navigationBarsPadding()
+            .padding(horizontal = 14.dp, vertical = 10.dp)
+    ) {
         Text("Pokemon Sets", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(10.dp))
 
@@ -532,7 +563,7 @@ fun SetsCatalogScreen(
                 onValueChange = { query = it },
                 placeholder = {
                     Text(
-                        if (searchAllCardsMode) "Поиск карты во всех сетах..." else "Search by sets",
+                        if (searchAllCardsMode) "Поиск карты во всех сетах..." else "Search by sets (${sets.size})",
                         color = TextMuted,
                         fontSize = 14.sp
                     )
@@ -575,7 +606,7 @@ fun SetsCatalogScreen(
             FilterChip(
                 selected = !searchAllCardsMode,
                 onClick = { searchAllCardsMode = false },
-                label = { Text("Сеты (${sets.size})", fontSize = 12.sp) }
+                label = { Text("Мои сеты (${displayedSets.size})", fontSize = 12.sp) }
             )
             FilterChip(
                 selected = searchAllCardsMode,
@@ -597,7 +628,7 @@ fun SetsCatalogScreen(
                 }
             } else if (globalCardResults.isEmpty()) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text("Ничего не найдено (откройте нужные сеты хотя бы раз)", color = TextMuted, fontSize = 13.sp)
+                    Text("Ничего не найдено", color = TextMuted, fontSize = 13.sp)
                 }
             } else {
                 LazyVerticalGrid(
@@ -616,13 +647,22 @@ fun SetsCatalogScreen(
                     }
                 }
             }
+        } else if (displayedSets.isEmpty()) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text(
+                    text = if (query.isBlank()) "Начните вводить название сета в поиске сверху,\nчтобы открыть его и добавить карты"
+                    else "Сет не найден",
+                    color = TextMuted,
+                    fontSize = 14.sp
+                )
+            }
         } else {
             LazyVerticalGrid(
                 columns = GridCells.Fixed(2),
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
-                items(filteredSets, key = { it.id }) { set ->
+                items(displayedSets, key = { it.id }) { set ->
                     val setSlots = slotsBySet[set.id]
                     val totalSlots = setSlots?.size ?: set.totalCards
                     val collectedCount = setSlots?.count { (quantities[it.slotId] ?: 0) > 0 } ?: 0
@@ -732,10 +772,12 @@ fun SetDetailScreen(
 ) {
     var searchQuery by remember { mutableStateOf("") }
     var sortAscending by remember { mutableStateOf(true) }
-    var filterMode by remember { mutableStateOf("ALL") }
     var showSortMenu by remember { mutableStateOf(false) }
     var isLoading by remember { mutableStateOf(false) }
     var errorText by remember { mutableStateOf<String?>(null) }
+
+    val gridState = rememberLazyGridState()
+    val scope = rememberCoroutineScope()
 
     LaunchedEffect(set.id) {
         if (slots.isEmpty()) {
@@ -752,32 +794,37 @@ fun SetDetailScreen(
         }
     }
 
-    val displayedSlots = remember(slots, searchQuery, sortAscending, filterMode, quantities) {
-        val filtered = slots.filter { slot ->
-            val qOk = searchQuery.isBlank() ||
-                slot.name.contains(searchQuery, ignoreCase = true) ||
+    val displayedSlots = remember(slots, searchQuery, sortAscending) {
+        val filtered = if (searchQuery.isBlank()) slots else slots.filter { slot ->
+            slot.name.contains(searchQuery, ignoreCase = true) ||
                 slot.localId.contains(searchQuery, ignoreCase = true)
-            val qty = quantities[slot.slotId] ?: 0
-            val fOk = when (filterMode) {
-                "OWNED" -> qty > 0
-                "MISSING" -> qty == 0
-                else -> true
-            }
-            qOk && fOk
         }
         if (sortAscending) {
-            filtered.sortedWith(compareBy({ numericCardOrder(it.localId) }, { it.finish }))
+            filtered.sortedWith(
+                compareBy({ numericCardOrder(it.localId) }, { if (it.finish == "Reverse Holofoil") 1 else 0 })
+            )
         } else {
-            filtered.sortedWith(compareByDescending<CardSlot> { numericCardOrder(it.localId) }.thenBy { it.finish })
+            filtered.sortedWith(
+                compareByDescending<CardSlot> { numericCardOrder(it.localId) }
+                    .thenBy { if (it.finish == "Reverse Holofoil") 1 else 0 }
+            )
         }
     }
 
     val totalSlots = if (slots.isNotEmpty()) slots.size else set.totalCards
     val collectedCount = slots.count { (quantities[it.slotId] ?: 0) > 0 }
 
-    Column(Modifier.fillMaxSize().background(BgBlack).padding(horizontal = 12.dp, vertical = 8.dp)) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(BgBlack)
+            .statusBarsPadding()
+            .navigationBarsPadding()
+            .padding(horizontal = 12.dp, vertical = 10.dp)
+    ) {
+        // Верхняя панель с нормальным отступом от статус-бара
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-            IconButton(onClick = onBack, modifier = Modifier.size(38.dp)) {
+            IconButton(onClick = onBack, modifier = Modifier.size(40.dp)) {
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Назад", tint = Color.White)
             }
             Box(
@@ -822,7 +869,7 @@ fun SetDetailScreen(
                         .clip(CircleShape)
                         .background(CardSurface)
                 ) {
-                    Icon(Icons.Default.Tune, contentDescription = "Sort & Filter", tint = Color.White, modifier = Modifier.size(20.dp))
+                    Icon(Icons.Default.Tune, contentDescription = "Sort", tint = Color.White, modifier = Modifier.size(20.dp))
                 }
                 DropdownMenu(
                     expanded = showSortMenu,
@@ -831,24 +878,19 @@ fun SetDetailScreen(
                 ) {
                     DropdownMenuItem(
                         text = { Text("123  Card Number: Low to High", color = if (sortAscending) AccentTeal else Color.White) },
-                        onClick = { sortAscending = true; showSortMenu = false }
+                        onClick = {
+                            sortAscending = true
+                            showSortMenu = false
+                            scope.launch { gridState.scrollToItem(0) }
+                        }
                     )
                     DropdownMenuItem(
                         text = { Text("321  Card Number: High to Low", color = if (!sortAscending) AccentTeal else Color.White) },
-                        onClick = { sortAscending = false; showSortMenu = false }
-                    )
-                    HorizontalDivider(color = BorderGray)
-                    DropdownMenuItem(
-                        text = { Text("Показать: Все карты", color = if (filterMode == "ALL") AccentTeal else Color.White) },
-                        onClick = { filterMode = "ALL"; showSortMenu = false }
-                    )
-                    DropdownMenuItem(
-                        text = { Text("Показать: Собранные (Qty > 0)", color = if (filterMode == "OWNED") AccentTeal else Color.White) },
-                        onClick = { filterMode = "OWNED"; showSortMenu = false }
-                    )
-                    DropdownMenuItem(
-                        text = { Text("Показать: Недостающие (Qty: 0)", color = if (filterMode == "MISSING") AccentTeal else Color.White) },
-                        onClick = { filterMode = "MISSING"; showSortMenu = false }
+                        onClick = {
+                            sortAscending = false
+                            showSortMenu = false
+                            scope.launch { gridState.scrollToItem(0) }
+                        }
                     )
                 }
             }
@@ -856,6 +898,7 @@ fun SetDetailScreen(
 
         Spacer(Modifier.height(10.dp))
 
+        // Шапка сета с логотипом и прогрессом
         Row(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp)
@@ -897,6 +940,7 @@ fun SetDetailScreen(
             }
         } else {
             LazyVerticalGrid(
+                state = gridState,
                 columns = GridCells.Fixed(2),
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
@@ -992,6 +1036,7 @@ fun CardGridItem(
 
             Spacer(Modifier.height(8.dp))
 
+            // Статичный текст Qty: X слева и отдельные круглые кнопки '-' и '+' справа
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -1001,21 +1046,43 @@ fun CardGridItem(
                     text = "Qty: $qty",
                     color = if (isOwned) Color.White else TextMuted,
                     fontSize = 13.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(6.dp))
-                        .clickable(enabled = qty > 0) { onDecrement() }
-                        .padding(vertical = 4.dp, horizontal = 2.dp)
+                    fontWeight = FontWeight.SemiBold
                 )
-                Box(
-                    modifier = Modifier
-                        .size(32.dp)
-                        .clip(CircleShape)
-                        .border(1.5.dp, Color.White.copy(alpha = 0.75f), CircleShape)
-                        .clickable { onIncrement() },
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(Icons.Default.Add, contentDescription = "Добавить", tint = Color.White, modifier = Modifier.size(18.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Box(
+                        modifier = Modifier
+                            .size(30.dp)
+                            .clip(CircleShape)
+                            .border(
+                                1.5.dp,
+                                if (qty > 0) Color.White.copy(alpha = 0.75f) else BorderGray,
+                                CircleShape
+                            )
+                            .clickable(enabled = qty > 0) { onDecrement() },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            Icons.Default.Remove,
+                            contentDescription = "Убавить",
+                            tint = if (qty > 0) Color.White else TextMuted,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                    Box(
+                        modifier = Modifier
+                            .size(30.dp)
+                            .clip(CircleShape)
+                            .border(1.5.dp, Color.White.copy(alpha = 0.75f), CircleShape)
+                            .clickable { onIncrement() },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            Icons.Default.Add,
+                            contentDescription = "Добавить",
+                            tint = Color.White,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
                 }
             }
         }
@@ -1220,13 +1287,20 @@ fun ScannerOverlayScreen(
             )
         }
 
-        Column(Modifier.align(Alignment.TopCenter).fillMaxWidth().padding(12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+        Column(
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .fillMaxWidth()
+                .statusBarsPadding()
+                .padding(12.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
             Surface(color = Color.Black.copy(0.84f), shape = RoundedCornerShape(16.dp)) {
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    IconButton(onClick = onClose, modifier = Modifier.size(34.dp)) {
+                    IconButton(onClick = onClose, modifier = Modifier.size(38.dp)) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Закрыть", tint = Color.White)
                     }
                     Column(Modifier.weight(1f).padding(horizontal = 4.dp)) {
@@ -1272,6 +1346,7 @@ fun ScannerOverlayScreen(
                 border = BorderStroke(1.dp, AccentTeal),
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
+                    .navigationBarsPadding()
                     .fillMaxWidth()
                     .padding(14.dp)
             ) {
