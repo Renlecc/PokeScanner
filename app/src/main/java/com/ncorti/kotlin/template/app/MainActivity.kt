@@ -85,6 +85,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.net.URLEncoder
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.math.abs
@@ -127,6 +128,56 @@ object NetClient {
 
 // --- TCGdex API Service ---
 object TcgDexRepository {
+    private fun generateSlotsForCard(
+        cid: String,
+        setId: String,
+        setName: String,
+        cname: String,
+        localId: String,
+        officialTotal: Int,
+        rarity: String,
+        imageUrl: String
+    ): List<CardSlot> {
+        val numVal = localId.filter { it.isDigit() }.toIntOrNull() ?: 0
+        val rLow = rarity.lowercase()
+        val nameLow = cname.lowercase()
+
+        val isUltraOrSecret = (officialTotal > 0 && numVal > officialTotal) ||
+            rLow.contains("ultra") ||
+            rLow.contains("illustration") ||
+            rLow.contains("hyper") ||
+            rLow.contains("secret") ||
+            rLow.contains("double rare") ||
+            rLow.contains("shiny") ||
+            rLow.contains("ace spec") ||
+            nameLow.endsWith(" ex") ||
+            nameLow.endsWith(" vmax") ||
+            nameLow.endsWith(" vstar") ||
+            nameLow.endsWith(" gx") ||
+            nameLow.endsWith(" v")
+
+        val finishes = when {
+            isUltraOrSecret -> listOf("Holofoil")
+            rLow == "rare holo" || rLow == "holo rare" -> listOf("Holofoil", "Reverse Holofoil")
+            else -> listOf("Normal", "Reverse Holofoil")
+        }
+
+        return finishes.map { fin ->
+            CardSlot(
+                slotId = "$cid::$fin",
+                cardId = cid,
+                setId = setId,
+                setName = setName,
+                name = cname,
+                localId = localId,
+                setTotal = officialTotal,
+                rarity = rarity,
+                finish = fin,
+                imageUrl = imageUrl
+            )
+        }
+    }
+
     suspend fun fetchAllSets(): List<TcgSet> = withContext(Dispatchers.IO) {
         val req = Request.Builder().url("https://api.tcgdex.net/v2/en/sets").build()
         NetClient.okHttp.newCall(req).execute().use { resp ->
@@ -176,46 +227,41 @@ object TcgDexRepository {
                 val imageUrl = "$imgBase/low.webp"
                 val rarity = obj.get("rarity")?.takeIf { !it.isJsonNull }?.asString ?: "Common"
 
-                val numVal = localId.filter { it.isDigit() }.toIntOrNull() ?: 0
-                val rLow = rarity.lowercase()
-                val nameLow = cname.lowercase()
+                slots.addAll(
+                    generateSlotsForCard(cid, set.id, setName, cname, localId, officialTotal, rarity, imageUrl)
+                )
+            }
+            slots
+        }
+    }
 
-                val isUltraOrSecret = (officialTotal > 0 && numVal > officialTotal) ||
-                    rLow.contains("ultra") ||
-                    rLow.contains("illustration") ||
-                    rLow.contains("hyper") ||
-                    rLow.contains("secret") ||
-                    rLow.contains("double rare") ||
-                    rLow.contains("shiny") ||
-                    rLow.contains("ace spec") ||
-                    nameLow.endsWith(" ex") ||
-                    nameLow.endsWith(" vmax") ||
-                    nameLow.endsWith(" vstar") ||
-                    nameLow.endsWith(" gx") ||
-                    nameLow.endsWith(" v")
+    suspend fun searchGlobalCards(query: String, setsMap: Map<String, TcgSet>): List<CardSlot> = withContext(Dispatchers.IO) {
+        val encoded = URLEncoder.encode(query.trim(), "UTF-8")
+        val req = Request.Builder().url("https://api.tcgdex.net/v2/en/cards?name=$encoded").build()
+        NetClient.okHttp.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) return@withContext emptyList()
+            val body = resp.body?.string() ?: return@withContext emptyList()
+            val arr = JsonParser.parseString(body).asJsonArray
+            val slots = mutableListOf<CardSlot>()
 
-                val finishes = when {
-                    isUltraOrSecret -> listOf("Holofoil")
-                    rLow == "rare holo" || rLow == "holo rare" -> listOf("Holofoil", "Reverse Holofoil")
-                    else -> listOf("Normal", "Reverse Holofoil")
-                }
+            for (el in arr) {
+                if (slots.size >= 120) break
+                val obj = el.asJsonObject
+                val cid = obj.get("id")?.takeIf { !it.isJsonNull }?.asString ?: continue
+                val cname = obj.get("name")?.takeIf { !it.isJsonNull }?.asString ?: continue
+                val localId = obj.get("localId")?.takeIf { !it.isJsonNull }?.asString ?: ""
+                val imgBase = obj.get("image")?.takeIf { !it.isJsonNull }?.asString ?: continue
+                val imageUrl = "$imgBase/low.webp"
 
-                for (fin in finishes) {
-                    slots.add(
-                        CardSlot(
-                            slotId = "$cid::$fin",
-                            cardId = cid,
-                            setId = set.id,
-                            setName = setName,
-                            name = cname,
-                            localId = localId,
-                            setTotal = officialTotal,
-                            rarity = rarity,
-                            finish = fin,
-                            imageUrl = imageUrl
-                        )
-                    )
-                }
+                // Извлекаем setId из id карты (например, "sv03.5-001" -> "sv03.5")
+                val setId = cid.substringBeforeLast("-", "")
+                val knownSet = setsMap[setId]
+                val setName = knownSet?.name ?: setId.uppercase()
+                val officialTotal = knownSet?.totalCards ?: 0
+
+                slots.addAll(
+                    generateSlotsForCard(cid, setId, setName, cname, localId, officialTotal, "Card", imageUrl)
+                )
             }
             slots
         }
@@ -342,8 +388,12 @@ fun numericCardOrder(localId: String): Int {
 
 fun formatCardNumber(localId: String, total: Int): String {
     val paddedLocal = if (localId.all { it.isDigit() } && localId.length < 3) localId.padStart(3, '0') else localId
-    val paddedTotal = total.toString().padStart(3, '0')
-    return "$paddedLocal/$paddedTotal"
+    return if (total > 0) {
+        val paddedTotal = total.toString().padStart(3, '0')
+        "$paddedLocal/$paddedTotal"
+    } else {
+        "#$paddedLocal"
+    }
 }
 
 // --- Theme Colors ---
@@ -409,6 +459,25 @@ fun PokemonCatalogApp() {
         val updated = if (next == 0) quantities - slotId else quantities + (slotId to next)
         quantities = updated
         store.saveQuantities(updated)
+
+        // Если добавили карту через глобальный поиск из ещё не открытого сета, подгружаем слоты этого сета в кэш,
+        // чтобы сет сразу отобразился в разделе "Мои сеты" на главном экране
+        if (next > 0) {
+            val setId = slotId.substringBefore("-", "")
+            if (setId.isNotEmpty() && !slotsBySet.containsKey(setId)) {
+                val targetSet = sets.find { it.id == setId }
+                if (targetSet != null) {
+                    scope.launch {
+                        try {
+                            val loaded = TcgDexRepository.fetchSetSlots(targetSet)
+                            val updatedSlots = slotsBySet + (targetSet.id to loaded)
+                            slotsBySet = updatedSlots
+                            store.saveAllSlots(updatedSlots)
+                        } catch (_: Exception) {}
+                    }
+                }
+            }
+        }
     }
 
     fun ensureHashesForSlots(slots: List<CardSlot>) {
@@ -522,6 +591,41 @@ fun SetsCatalogScreen(
 ) {
     var query by remember { mutableStateOf("") }
     var searchAllCardsMode by remember { mutableStateOf(false) }
+    var remoteCardResults by remember { mutableStateOf<List<CardSlot>>(emptyList()) }
+    var isSearchingCards by remember { mutableStateOf(false) }
+
+    val setsMap = remember(sets) { sets.associateBy { it.id } }
+
+    // Глобальный поиск карт по всей базе TCGdex (с небольшой задержкой при вводе)
+    LaunchedEffect(query, searchAllCardsMode) {
+        if (!searchAllCardsMode) {
+            remoteCardResults = emptyList()
+            isSearchingCards = false
+            return@LaunchedEffect
+        }
+        val q = query.trim()
+        if (q.length < 2) {
+            remoteCardResults = emptyList()
+            isSearchingCards = false
+            return@LaunchedEffect
+        }
+        delay(400)
+        isSearchingCards = true
+        try {
+            val localMatches = slotsBySet.values.flatten().filter {
+                it.name.contains(q, ignoreCase = true) || it.localId.contains(q, ignoreCase = true)
+            }
+            val apiMatches = TcgDexRepository.searchGlobalCards(q, setsMap)
+            val merged = (localMatches + apiMatches).distinctBy { it.slotId }
+            remoteCardResults = merged
+        } catch (_: Exception) {
+            remoteCardResults = slotsBySet.values.flatten().filter {
+                it.name.contains(q, ignoreCase = true) || it.localId.contains(q, ignoreCase = true)
+            }
+        } finally {
+            isSearchingCards = false
+        }
+    }
 
     val displayedSets = remember(sets, slotsBySet, quantities, query) {
         if (query.isNotBlank()) {
@@ -530,17 +634,12 @@ fun SetsCatalogScreen(
             }
         } else {
             sets.filter { set ->
-                val setSlots = slotsBySet[set.id] ?: return@filter false
-                setSlots.any { (quantities[it.slotId] ?: 0) > 0 }
+                val setSlots = slotsBySet[set.id]
+                val hasInSlots = setSlots?.any { (quantities[it.slotId] ?: 0) > 0 } == true
+                val hasInQuantities = quantities.keys.any { it.startsWith("${set.id}-") }
+                hasInSlots || hasInQuantities
             }
         }
-    }
-
-    val globalCardResults = remember(slotsBySet, query, searchAllCardsMode) {
-        if (!searchAllCardsMode || query.isBlank()) emptyList()
-        else slotsBySet.values.flatten().filter {
-            it.name.contains(query, ignoreCase = true) || it.localId.contains(query, ignoreCase = true)
-        }.take(80)
     }
 
     Column(
@@ -557,7 +656,7 @@ fun SetsCatalogScreen(
                 onValueChange = { query = it },
                 placeholder = {
                     Text(
-                        if (searchAllCardsMode) "Поиск карты во всех сетах..." else "Search by sets (${sets.size})",
+                        if (searchAllCardsMode) "Имя карты (от 2 букв)..." else "Search by sets (${sets.size})",
                         color = TextMuted,
                         fontSize = 14.sp
                     )
@@ -616,13 +715,17 @@ fun SetsCatalogScreen(
                 CircularProgressIndicator(color = AccentTeal)
             }
         } else if (searchAllCardsMode) {
-            if (query.isBlank()) {
+            if (query.trim().length < 2) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text("Введите имя покемона или номер карты", color = TextMuted, fontSize = 14.sp)
+                    Text("Введите минимум 2 буквы имени покемона", color = TextMuted, fontSize = 14.sp)
                 }
-            } else if (globalCardResults.isEmpty()) {
+            } else if (isSearchingCards) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text("Ничего не найдено", color = TextMuted, fontSize = 13.sp)
+                    CircularProgressIndicator(color = AccentTeal)
+                }
+            } else if (remoteCardResults.isEmpty()) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("Карты не найдены", color = TextMuted, fontSize = 14.sp)
                 }
             } else {
                 LazyVerticalGrid(
@@ -630,7 +733,7 @@ fun SetsCatalogScreen(
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    items(globalCardResults, key = { it.slotId }) { slot ->
+                    items(remoteCardResults, key = { it.slotId }) { slot ->
                         val qty = quantities[slot.slotId] ?: 0
                         CardGridItem(
                             slot = slot,
@@ -659,7 +762,8 @@ fun SetsCatalogScreen(
                 items(displayedSets, key = { it.id }) { set ->
                     val setSlots = slotsBySet[set.id]
                     val totalSlots = setSlots?.size ?: set.totalCards
-                    val collectedCount = setSlots?.count { (quantities[it.slotId] ?: 0) > 0 } ?: 0
+                    val collectedCount = setSlots?.count { (quantities[it.slotId] ?: 0) > 0 }
+                        ?: quantities.keys.count { it.startsWith("${set.id}-") }
 
                     Column(
                         modifier = Modifier
@@ -748,7 +852,6 @@ fun SetDetailScreen(
 
     val gridState = rememberLazyGridState()
 
-    // Сбрасываем скролл в самый верх ПОСЛЕ того, как список перестроился с новой сортировкой или фильтром
     LaunchedEffect(sortAscending, filterMode) {
         gridState.scrollToItem(0)
     }
