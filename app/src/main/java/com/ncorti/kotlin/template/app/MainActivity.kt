@@ -98,15 +98,15 @@ data class TcgSet(
 )
 
 data class CardSlot(
-    val slotId: String,       // e.g. "sv03.5-001::Normal"
-    val cardId: String,       // e.g. "sv03.5-001"
+    val slotId: String,
+    val cardId: String,
     val setId: String,
     val setName: String,
     val name: String,
-    val localId: String,      // e.g. "001"
+    val localId: String,
     val setTotal: Int,
     val rarity: String,
-    val finish: String,       // "Normal", "Reverse Holofoil", "Holofoil"
+    val finish: String,
     val imageUrl: String
 )
 
@@ -215,32 +215,25 @@ class LocalStore(ctx: Context) {
     private val slotsFile = File(ctx.filesDir, "tcg_slots_v1.json")
     private val hashFile = File(ctx.filesDir, "tcg_hashes_v1.json")
 
-    fun loadQuantities(): Map<String, Int> = try {
-        if (!qtyFile.exists()) emptyMap()
-        else gson.fromJson(qtyFile.readText(), object : TypeToken>() {}.type) ?: emptyMap()
-    } catch (_: Exception) { emptyMap() }
+    private inline fun <reified T> readJson(file: File, fallback: T): T {
+        return try {
+            if (!file.exists()) fallback
+            else gson.fromJson<T>(file.readText(), object : TypeToken<T>() {}.type) ?: fallback
+        } catch (_: Exception) {
+            fallback
+        }
+    }
 
+    fun loadQuantities(): Map<String, Int> = readJson(qtyFile, emptyMap())
     fun saveQuantities(map: Map<String, Int>) = qtyFile.writeText(gson.toJson(map))
 
-    fun loadSets(): List<TcgSet> = try {
-        if (!setsFile.exists()) emptyList()
-        else gson.fromJson(setsFile.readText(), object : TypeToken<List<TcgSet>>() {}.type) ?: emptyList()
-    } catch (_: Exception) { emptyList() }
-
+    fun loadSets(): List<TcgSet> = readJson(setsFile, emptyList())
     fun saveSets(sets: List<TcgSet>) = setsFile.writeText(gson.toJson(sets))
 
-    fun loadAllSlots(): Map<String, List<CardSlot>> = try {
-        if (!slotsFile.exists()) emptyMap()
-        else gson.fromJson(slotsFile.readText(), object : TypeToken>>() {}.type) ?: emptyMap()
-    } catch (_: Exception) { emptyMap() }
-
+    fun loadAllSlots(): Map<String, List<CardSlot>> = readJson(slotsFile, emptyMap())
     fun saveAllSlots(map: Map<String, List<CardSlot>>) = slotsFile.writeText(gson.toJson(map))
 
-    fun loadHashes(): Map<String, CardHashEntry> = try {
-        if (!hashFile.exists()) emptyMap()
-        else gson.fromJson(hashFile.readText(), object : TypeToken>() {}.type) ?: emptyMap()
-    } catch (_: Exception) { emptyMap() }
-
+    fun loadHashes(): Map<String, CardHashEntry> = readJson(hashFile, emptyMap())
     fun saveHashes(map: Map<String, CardHashEntry>) = hashFile.writeText(gson.toJson(map))
 }
 
@@ -287,7 +280,6 @@ object CardRecognizer {
         if (candidateSlots.isEmpty()) return null
         val uniqueCards = candidateSlots.distinctBy { it.cardId }
 
-        // 1. Проверяем, прочитался ли номер карты (например, 001/084 или 17/86) или точное имя в рамках этого пула
         val ocrClean = ocrText.replace('O', '0').replace('o', '0').replace('I', '1').replace('l', '1')
         val slashMatch = Regex("""\b(\d{1,3})\s*/\s*\d{2,3}\b""").find(ocrClean)
         val detectedNum = slashMatch?.groupValues?.get(1)?.trimStart('0')?.ifEmpty { "0" }
@@ -308,12 +300,10 @@ object CardRecognizer {
 
             var score = hamming * 35 + (colorDiff / 48)
 
-            // Бонус за совпадение номера в OCR
             val cardNumClean = card.localId.trimStart('0').ifEmpty { "0" }
             if (detectedNum != null && detectedNum == cardNumClean) {
                 score -= 260
             }
-            // Бонус за совпадение имени покемона в OCR
             if (card.name.length >= 4 && ocrLower.contains(card.name.lowercase())) {
                 score -= 220
             }
@@ -536,7 +526,6 @@ fun SetsCatalogScreen(
         Text("Pokemon Sets", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(10.dp))
 
-        // Поле поиска + значок камеры рядом
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
             OutlinedTextField(
                 value = query,
@@ -582,7 +571,6 @@ fun SetsCatalogScreen(
 
         Spacer(Modifier.height(8.dp))
 
-        // Переключатель: искать сеты или карты во всех сетах
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             FilterChip(
                 selected = !searchAllCardsMode,
@@ -744,7 +732,7 @@ fun SetDetailScreen(
 ) {
     var searchQuery by remember { mutableStateOf("") }
     var sortAscending by remember { mutableStateOf(true) }
-    var filterMode by remember { mutableStateOf("ALL") } // ALL, OWNED, MISSING
+    var filterMode by remember { mutableStateOf("ALL") }
     var showSortMenu by remember { mutableStateOf(false) }
     var isLoading by remember { mutableStateOf(false) }
     var errorText by remember { mutableStateOf<String?>(null) }
@@ -788,7 +776,6 @@ fun SetDetailScreen(
     val collectedCount = slots.count { (quantities[it.slotId] ?: 0) > 0 }
 
     Column(Modifier.fillMaxSize().background(BgBlack).padding(horizontal = 12.dp, vertical = 8.dp)) {
-        // Верхняя панель как на скриншоте 2 и 3: Назад + Камера + Поиск + Сортировка/Фильтр
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
             IconButton(onClick = onBack, modifier = Modifier.size(38.dp)) {
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Назад", tint = Color.White)
@@ -869,7 +856,6 @@ fun SetDetailScreen(
 
         Spacer(Modifier.height(10.dp))
 
-        // Шапка сета с логотипом и прогрессом
         Row(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp)
@@ -1214,7 +1200,6 @@ fun ScannerOverlayScreen(
             }
         }, modifier = Modifier.fillMaxSize())
 
-        // Большая рамка под пропорции карты 2.5 x 3.5
         Canvas(modifier = Modifier.fillMaxSize()) {
             val targetRatio = 2.5f / 3.5f
             var boxW = size.width * 0.82f
@@ -1235,7 +1220,6 @@ fun ScannerOverlayScreen(
             )
         }
 
-        // Верхняя плашка сканера
         Column(Modifier.align(Alignment.TopCenter).fillMaxWidth().padding(12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
             Surface(color = Color.Black.copy(0.84f), shape = RoundedCornerShape(16.dp)) {
                 Row(
@@ -1278,7 +1262,6 @@ fun ScannerOverlayScreen(
             }
         }
 
-        // Нижняя карточка последней распознанной карты с выбором слота вариации (Normal / Reverse Holofoil)
         detectedCard?.let { card ->
             val siblingSlots = remember(card.cardId, candidateSlots) {
                 candidateSlots.filter { it.cardId == card.cardId }
