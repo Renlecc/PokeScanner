@@ -148,7 +148,6 @@ object TcgDexRepository {
                     list.add(TcgSet(id, name, logoUrl, releaseDate, total))
                 }
             }
-            // Сеты с датой выхода сортируем от самых новых к старым, промо без даты отправляем в конец
             list.sortedWith(
                 compareBy<TcgSet> { it.releaseDate.isNullOrBlank() }
                     .thenByDescending { it.releaseDate ?: "" }
@@ -181,7 +180,6 @@ object TcgDexRepository {
                 val rLow = rarity.lowercase()
                 val nameLow = cname.lowercase()
 
-                // Определяем, ультра-редкая ли это карта (1 слот Holofoil) или обычная/редкая (2 слота: основная + Reverse Holofoil)
                 val isUltraOrSecret = (officialTotal > 0 && numVal > officialTotal) ||
                     rLow.contains("ultra") ||
                     rLow.contains("illustration") ||
@@ -525,7 +523,6 @@ fun SetsCatalogScreen(
     var query by remember { mutableStateOf("") }
     var searchAllCardsMode by remember { mutableStateOf(false) }
 
-    // По умолчанию показываем только начатые сеты (куда добавлены карты); при поиске показываем все подходящие из памяти
     val displayedSets = remember(sets, slotsBySet, quantities, query) {
         if (query.isNotBlank()) {
             sets.filter {
@@ -554,9 +551,6 @@ fun SetsCatalogScreen(
             .navigationBarsPadding()
             .padding(horizontal = 14.dp, vertical = 10.dp)
     ) {
-        Text("Pokemon Sets", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(10.dp))
-
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
             OutlinedTextField(
                 value = query,
@@ -666,7 +660,6 @@ fun SetsCatalogScreen(
                     val setSlots = slotsBySet[set.id]
                     val totalSlots = setSlots?.size ?: set.totalCards
                     val collectedCount = setSlots?.count { (quantities[it.slotId] ?: 0) > 0 } ?: 0
-                    val progress = if (totalSlots > 0) (collectedCount.toFloat() / totalSlots).coerceIn(0f, 1f) else 0f
 
                     Column(
                         modifier = Modifier
@@ -689,7 +682,7 @@ fun SetsCatalogScreen(
                                     contentScale = ContentScale.Fit,
                                     modifier = Modifier
                                         .fillMaxSize()
-                                        .padding(horizontal = 14.dp, vertical = 18.dp)
+                                        .padding(horizontal = 14.dp, vertical = 14.dp)
                                 )
                             } else {
                                 Text(
@@ -710,30 +703,6 @@ fun SetsCatalogScreen(
                                         .padding(horizontal = 6.dp, vertical = 2.dp)
                                 ) {
                                     Text(set.releaseDate, color = Color(0xFFB0B8BE), fontSize = 10.sp)
-                                }
-                            }
-
-                            if (collectedCount > 0) {
-                                Box(
-                                    modifier = Modifier
-                                        .align(Alignment.BottomCenter)
-                                        .fillMaxWidth()
-                                        .height(16.dp)
-                                        .background(Color(0xFF2A3033))
-                                ) {
-                                    Box(
-                                        modifier = Modifier
-                                            .fillMaxHeight()
-                                            .fillMaxWidth(progress)
-                                            .background(AccentTeal)
-                                    )
-                                    Text(
-                                        text = "${(progress * 100).toInt()}%",
-                                        color = Color.White,
-                                        fontSize = 10.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        modifier = Modifier.align(Alignment.Center)
-                                    )
                                 }
                             }
                         }
@@ -772,6 +741,7 @@ fun SetDetailScreen(
 ) {
     var searchQuery by remember { mutableStateOf("") }
     var sortAscending by remember { mutableStateOf(true) }
+    var filterMode by remember { mutableStateOf("ALL") } // ALL, OWNED, MISSING
     var showSortMenu by remember { mutableStateOf(false) }
     var isLoading by remember { mutableStateOf(false) }
     var errorText by remember { mutableStateOf<String?>(null) }
@@ -794,10 +764,18 @@ fun SetDetailScreen(
         }
     }
 
-    val displayedSlots = remember(slots, searchQuery, sortAscending) {
-        val filtered = if (searchQuery.isBlank()) slots else slots.filter { slot ->
-            slot.name.contains(searchQuery, ignoreCase = true) ||
+    val displayedSlots = remember(slots, searchQuery, sortAscending, filterMode, quantities) {
+        val filtered = slots.filter { slot ->
+            val qOk = searchQuery.isBlank() ||
+                slot.name.contains(searchQuery, ignoreCase = true) ||
                 slot.localId.contains(searchQuery, ignoreCase = true)
+            val qty = quantities[slot.slotId] ?: 0
+            val fOk = when (filterMode) {
+                "OWNED" -> qty > 0
+                "MISSING" -> qty == 0
+                else -> true
+            }
+            qOk && fOk
         }
         if (sortAscending) {
             filtered.sortedWith(
@@ -822,7 +800,6 @@ fun SetDetailScreen(
             .navigationBarsPadding()
             .padding(horizontal = 12.dp, vertical = 10.dp)
     ) {
-        // Верхняя панель с нормальным отступом от статус-бара
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
             IconButton(onClick = onBack, modifier = Modifier.size(40.dp)) {
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Назад", tint = Color.White)
@@ -869,7 +846,7 @@ fun SetDetailScreen(
                         .clip(CircleShape)
                         .background(CardSurface)
                 ) {
-                    Icon(Icons.Default.Tune, contentDescription = "Sort", tint = Color.White, modifier = Modifier.size(20.dp))
+                    Icon(Icons.Default.Tune, contentDescription = "Sort & Filter", tint = Color.White, modifier = Modifier.size(20.dp))
                 }
                 DropdownMenu(
                     expanded = showSortMenu,
@@ -892,13 +869,37 @@ fun SetDetailScreen(
                             scope.launch { gridState.scrollToItem(0) }
                         }
                     )
+                    HorizontalDivider(color = BorderGray)
+                    DropdownMenuItem(
+                        text = { Text("Показать: Все карты", color = if (filterMode == "ALL") AccentTeal else Color.White) },
+                        onClick = {
+                            filterMode = "ALL"
+                            showSortMenu = false
+                            scope.launch { gridState.scrollToItem(0) }
+                        }
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Показать: Есть (Qty > 0)", color = if (filterMode == "OWNED") AccentTeal else Color.White) },
+                        onClick = {
+                            filterMode = "OWNED"
+                            showSortMenu = false
+                            scope.launch { gridState.scrollToItem(0) }
+                        }
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Показать: Нету (Qty: 0)", color = if (filterMode == "MISSING") AccentTeal else Color.White) },
+                        onClick = {
+                            filterMode = "MISSING"
+                            showSortMenu = false
+                            scope.launch { gridState.scrollToItem(0) }
+                        }
+                    )
                 }
             }
         }
 
         Spacer(Modifier.height(10.dp))
 
-        // Шапка сета с логотипом и прогрессом
         Row(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp)
@@ -1036,7 +1037,6 @@ fun CardGridItem(
 
             Spacer(Modifier.height(8.dp))
 
-            // Статичный текст Qty: X слева и отдельные круглые кнопки '-' и '+' справа
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
