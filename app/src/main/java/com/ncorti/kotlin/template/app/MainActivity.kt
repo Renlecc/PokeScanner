@@ -6,12 +6,8 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color as AndroidColor
-import android.graphics.ImageFormat
 import android.graphics.Matrix
-import android.graphics.Rect
-import android.graphics.YuvImage
 import android.media.AudioManager
-import android.media.Image
 import android.media.ToneGenerator
 import android.os.Build
 import android.os.Bundle
@@ -34,10 +30,12 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -83,7 +81,6 @@ import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import java.io.ByteArrayOutputStream
 import java.io.File
 import java.net.URLEncoder
 import java.util.concurrent.Executors
@@ -117,6 +114,17 @@ data class CardHashEntry(
     val setId: String,
     val dHash: Long,
     val colorSig: IntArray
+)
+
+data class PendingScanItem(
+    val uid: Long,
+    val slot: CardSlot,
+    val needsCheck: Boolean
+)
+
+data class CardMatchResult(
+    val card: CardSlot,
+    val needsCheck: Boolean
 )
 
 object NetClient {
@@ -253,7 +261,6 @@ object TcgDexRepository {
                 val imgBase = obj.get("image")?.takeIf { !it.isJsonNull }?.asString ?: continue
                 val imageUrl = "$imgBase/low.webp"
 
-                // Извлекаем setId из id карты (например, "sv03.5-001" -> "sv03.5")
                 val setId = cid.substringBeforeLast("-", "")
                 val knownSet = setsMap[setId]
                 val setName = knownSet?.name ?: setId.uppercase()
@@ -298,7 +305,7 @@ class LocalStore(ctx: Context) {
     fun saveHashes(map: Map<String, CardHashEntry>) = hashFile.writeText(gson.toJson(map))
 }
 
-// --- Visual Matcher + OCR Assist ---
+// --- Visual Matcher + OCR Primary ---
 object CardRecognizer {
     fun computeSignature(bmp: Bitmap): Pair<Long, IntArray> {
         val gray = Bitmap.createScaledBitmap(bmp, 9, 8, true)
@@ -331,51 +338,150 @@ object CardRecognizer {
         return hash to sig
     }
 
+    private fun levenshtein(a: String, b: String): Int {
+        if (a == b) return 0
+        if (a.isEmpty()) return b.length
+        if (b.isEmpty()) return a.length
+        val dp = IntArray(b.length + 1) { it }
+        for (i in 1..a.length) {
+            var prev = i - 1
+            dp[0] = i
+            for (j in 1..b.length) {
+                val temp = dp[j]
+                val cost = if (a[i - 1] == b[j - 1]) 0 else 1
+                dp[j] = minOf(dp[j] + 1, dp[j - 1] + 1, prev + cost)
+                prev = temp
+            }
+        }
+        return dp[b.length]
+    }
+
+    private fun nameMatches(cardName: String, nameZoneText: String): Boolean {
+        val target = cardName.lowercase().trim()
+        if (target.length < 2) return false
+        val cleaned = nameZoneText.lowercase().replace(Regex("[^a-z0-9\\s'-]"), " ")
+        if (cleaned.contains(target)) return true
+
+        val words = cleaned.split(Regex("\\s+")).filter { it.length >= 3 }
+        for (w in words) {
+            if (abs(w.length - target.length) <= 1 && levenshtein(w, target) <= 1) {
+                return true
+            }
+        }
+        for (i in 0 until words.size - 1) {
+            val pair = "${words[i]} ${words[i + 1]}"
+            if (abs(pair.length - target.length) <= 1 && levenshtein(pair, target) <= 1) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun visualDistanceScore(
+        card: CardSlot,
+        frameHash: Long,
+        frameColor: IntArray,
+        hashes: Map<String, CardHashEntry>
+    ): Int {
+        val hEntry = hashes[card.cardId] ?: return Int.MAX_VALUE
+        val hamming = java.lang.Long.bitCount(frameHash xor hEntry.dHash)
+        var colorDiff = 0
+        if (hEntry.colorSig.size == 48) {
+            for (i in 0 until 48) colorDiff += abs(frameColor[i] - hEntry.colorSig[i])
+        } else {
+            colorDiff = 25 * 48
+        }
+        return hamming * 35 + (colorDiff / 48)
+    }
+
     fun matchCard(
         frameHash: Long,
         frameColor: IntArray,
-        ocrText: String,
+        bottomLeftText: String,
+        topNameText: String,
+        isScopedSet: Boolean,
         candidateSlots: List<CardSlot>,
         hashes: Map<String, CardHashEntry>
-    ): CardSlot? {
+    ): CardMatchResult? {
         if (candidateSlots.isEmpty()) return null
+
+        val numRaw = bottomLeftText
+            .replace('O', '0')
+            .replace('o', '0')
+            .replace('I', '1')
+            .replace('l', '1')
+
+        val slashMatch = Regex("""\b(\d{1,3})\s*/\s*(\d{2,3})\b""").find(numRaw)
+        val parsedLocalNum = slashMatch?.groupValues?.get(1)?.trimStart('0')?.ifEmpty { "0" }
+            ?: if (isScopedSet) {
+                Regex("""\b(\d{1,3})\b""").find(numRaw)?.groupValues?.get(1)?.trimStart('0')?.ifEmpty { "0" }
+            } else {
+                null
+            }
+        val parsedSetTotal = slashMatch?.groupValues?.get(2)?.toIntOrNull()
+
+        val hasNameText = topNameText.trim().length >= 3
+        if (parsedLocalNum == null && !hasNameText) return null
+
         val uniqueCards = candidateSlots.distinctBy { it.cardId }
 
-        val ocrClean = ocrText.replace('O', '0').replace('o', '0').replace('I', '1').replace('l', '1')
-        val slashMatch = Regex("""\b(\d{1,3})\s*/\s*\d{2,3}\b""").find(ocrClean)
-        val detectedNum = slashMatch?.groupValues?.get(1)?.trimStart('0')?.ifEmpty { "0" }
-        val ocrLower = ocrText.lowercase()
-
-        var bestCard: CardSlot? = null
-        var bestScore = Int.MAX_VALUE
-
-        for (card in uniqueCards) {
-            val hEntry = hashes[card.cardId]
-            val hamming = if (hEntry != null) java.lang.Long.bitCount(frameHash xor hEntry.dHash) else 16
-            var colorDiff = 0
-            if (hEntry != null && hEntry.colorSig.size == 48) {
-                for (i in 0 until 48) colorDiff += abs(frameColor[i] - hEntry.colorSig[i])
+        // Глобальный режим: строго требуется "/TTT" и совпадение setTotal
+        if (!isScopedSet) {
+            if (parsedLocalNum == null || parsedSetTotal == null) return null
+            val matching = uniqueCards.filter { card ->
+                val cNum = card.localId.filter { it.isDigit() }.trimStart('0').ifEmpty { "0" }
+                cNum == parsedLocalNum && card.setTotal == parsedSetTotal
+            }
+            if (matching.isEmpty()) return null
+            val sorted = matching.sortedBy { visualDistanceScore(it, frameHash, frameColor, hashes) }
+            if (sorted.size == 1) {
+                return CardMatchResult(sorted.first(), needsCheck = false)
+            }
+            val byName = sorted.firstOrNull { nameMatches(it.name, topNameText) }
+            return if (byName != null) {
+                CardMatchResult(byName, needsCheck = false)
             } else {
-                colorDiff = 25 * 48
-            }
-
-            var score = hamming * 35 + (colorDiff / 48)
-
-            val cardNumClean = card.localId.trimStart('0').ifEmpty { "0" }
-            if (detectedNum != null && detectedNum == cardNumClean) {
-                score -= 260
-            }
-            if (card.name.length >= 4 && ocrLower.contains(card.name.lowercase())) {
-                score -= 220
-            }
-
-            if (score < bestScore) {
-                bestScore = score
-                bestCard = card
+                CardMatchResult(sorted.first(), needsCheck = true)
             }
         }
 
-        return if (bestCard != null && bestScore <= 580) bestCard else null
+        // Режим внутри сета
+        if (parsedLocalNum != null) {
+            val numCandidates = uniqueCards.filter { card ->
+                val cNum = card.localId.filter { it.isDigit() }.trimStart('0').ifEmpty { "0" }
+                cNum == parsedLocalNum
+            }
+            if (numCandidates.isEmpty()) return null
+
+            val sorted = numCandidates.sortedBy { visualDistanceScore(it, frameHash, frameColor, hashes) }
+            if (sorted.size == 1) {
+                return CardMatchResult(sorted.first(), needsCheck = false)
+            }
+
+            val nameMatched = sorted.filter { nameMatches(it.name, topNameText) }
+            if (nameMatched.size == 1) {
+                return CardMatchResult(nameMatched.first(), needsCheck = false)
+            }
+            if (nameMatched.size > 1) {
+                return CardMatchResult(nameMatched.first(), needsCheck = true)
+            }
+            return CardMatchResult(sorted.first(), needsCheck = true)
+        }
+
+        // Номер не прочитан, пробуем только по имени внутри сета
+        if (hasNameText) {
+            val nameCandidates = uniqueCards
+                .filter { nameMatches(it.name, topNameText) }
+                .sortedBy { visualDistanceScore(it, frameHash, frameColor, hashes) }
+            if (nameCandidates.size == 1) {
+                return CardMatchResult(nameCandidates.first(), needsCheck = false)
+            }
+            if (nameCandidates.size > 1) {
+                return CardMatchResult(nameCandidates.first(), needsCheck = true)
+            }
+        }
+
+        return null
     }
 }
 
@@ -460,8 +566,6 @@ fun PokemonCatalogApp() {
         quantities = updated
         store.saveQuantities(updated)
 
-        // Если добавили карту через глобальный поиск из ещё не открытого сета, подгружаем слоты этого сета в кэш,
-        // чтобы сет сразу отобразился в разделе "Мои сеты" на главном экране
         if (next > 0) {
             val setId = slotId.substringBefore("-", "")
             if (setId.isNotEmpty() && !slotsBySet.containsKey(setId)) {
@@ -596,7 +700,6 @@ fun SetsCatalogScreen(
 
     val setsMap = remember(sets) { sets.associateBy { it.id } }
 
-    // Глобальный поиск карт по всей базе TCGdex (с небольшой задержкой при вводе)
     LaunchedEffect(query, searchAllCardsMode) {
         if (!searchAllCardsMode) {
             remoteCardResults = emptyList()
@@ -1191,32 +1294,19 @@ fun CardGridItem(
     }
 }
 
-// --- Screen 3: Scoped Scanner ---
-fun extractCardCropBitmap(image: Image, rotationDegrees: Int): Bitmap? {
+// --- Screen 3: Scoped & Batch Scanner ---
+fun extractCardCropBitmap(imageProxy: ImageProxy, extraRotationDegrees: Int): Bitmap? {
     return try {
-        val yBuffer = image.planes[0].buffer
-        val uBuffer = image.planes[1].buffer
-        val vBuffer = image.planes[2].buffer
-        val ySize = yBuffer.remaining()
-        val uSize = uBuffer.remaining()
-        val vSize = vBuffer.remaining()
-        val nv21 = ByteArray(ySize + uSize + vSize)
-        yBuffer.get(nv21, 0, ySize)
-        vBuffer.get(nv21, ySize, vSize)
-        uBuffer.get(nv21, ySize + vSize, uSize)
-
-        val yuvImage = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
-        val rawStream = ByteArrayOutputStream()
-        yuvImage.compressToJpeg(Rect(0, 0, image.width, image.height), 85, rawStream)
-        val rawBytes = rawStream.toByteArray()
-        val bmp = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size) ?: return null
-
-        val rotated = if (rotationDegrees != 0) {
-            val m = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
-            Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true).also {
-                if (it != bmp) bmp.recycle()
+        val rawBmp = imageProxy.toBitmap()
+        val totalRotation = (imageProxy.imageInfo.rotationDegrees + extraRotationDegrees) % 360
+        val rotated = if (totalRotation != 0) {
+            val m = Matrix().apply { postRotate(totalRotation.toFloat()) }
+            Bitmap.createBitmap(rawBmp, 0, 0, rawBmp.width, rawBmp.height, m, true).also {
+                if (it != rawBmp) rawBmp.recycle()
             }
-        } else bmp
+        } else {
+            rawBmp
+        }
 
         val w = rotated.width
         val h = rotated.height
@@ -1230,7 +1320,13 @@ fun extractCardCropBitmap(image: Image, rotationDegrees: Int): Bitmap? {
         val left = ((w - cropW) / 2).coerceAtLeast(0)
         val top = ((h - cropH) / 2 + (h * 0.03f).toInt()).coerceIn(0, (h - cropH).coerceAtLeast(0))
 
-        val cropped = Bitmap.createBitmap(rotated, left, top, cropW.coerceAtMost(w - left), cropH.coerceAtMost(h - top))
+        val cropped = Bitmap.createBitmap(
+            rotated,
+            left,
+            top,
+            cropW.coerceAtMost(w - left),
+            cropH.coerceAtMost(h - top)
+        )
         if (cropped != rotated) rotated.recycle()
         cropped
     } catch (_: Exception) {
@@ -1251,43 +1347,87 @@ fun ScannerOverlayScreen(
     val owner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
 
-    var perm by remember { mutableStateOf(ContextCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) }
+    var perm by remember {
+        mutableStateOf(ContextCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED)
+    }
     val launch = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { perm = it }
     LaunchedEffect(Unit) { if (!perm) launch.launch(Manifest.permission.CAMERA) }
 
+    val analysisExecutor = remember { Executors.newSingleThreadExecutor() }
+    val textRecognizer = remember { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
+    var cameraProviderRef by remember { mutableStateOf<ProcessCameraProvider?>(null) }
+    var camCtrl by remember { mutableStateOf<Camera?>(null) }
+
+    val tone = remember { try { ToneGenerator(AudioManager.STREAM_NOTIFICATION, 95) } catch (_: Exception) { null } }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            try { cameraProviderRef?.unbindAll() } catch (_: Exception) {}
+            try { textRecognizer.close() } catch (_: Exception) {}
+            try { analysisExecutor.shutdown() } catch (_: Exception) {}
+            try { tone?.release() } catch (_: Exception) {}
+        }
+    }
+
+    var selectedBatchFinish by remember { mutableStateOf("Normal") }
+    var pendingBatch by remember { mutableStateOf<List<PendingScanItem>>(emptyList()) }
+    var uidCounter by remember { mutableLongStateOf(1L) }
+
     var statusText by remember {
         mutableStateOf(
-            if (scopeSet != null) "Сканирую сет: ${scopeSet.name}"
-            else "Сканирую все открытые сеты (${candidateSlots.distinctBy { it.cardId }.size} карт)"
+            if (scopeSet != null) "Сет: ${scopeSet.name}"
+            else "Глобальный режим (${candidateSlots.distinctBy { it.cardId }.size} карт)"
         )
     }
-    var detectedCard by remember { mutableStateOf<CardSlot?>(null) }
-    var lastAddedCardId by remember { mutableStateOf("") }
-    var lastMatchedHash by remember { mutableLongStateOf(0L) }
-    var streakId by remember { mutableStateOf("") }
-    var streakCount by remember { mutableIntStateOf(0) }
     var bannerText by remember { mutableStateOf<String?>(null) }
     var torch by remember { mutableStateOf(false) }
     var extraRot by remember { mutableIntStateOf(0) }
-    var camCtrl by remember { mutableStateOf<Camera?>(null) }
+
+    val lockedCardIdRef = remember { mutableStateOf("") }
+    val emptyFramesRef = remember { mutableIntStateOf(0) }
+    val diffStreakIdRef = remember { mutableStateOf("") }
+    val diffStreakCountRef = remember { mutableIntStateOf(0) }
+    val streakCardIdRef = remember { mutableStateOf("") }
+    val streakCountRef = remember { mutableIntStateOf(0) }
 
     val curSlots by rememberUpdatedState(candidateSlots)
     val curHashes by rememberUpdatedState(hashes)
     val curExtraRot by rememberUpdatedState(extraRot)
-
-    val tone = remember { try { ToneGenerator(AudioManager.STREAM_NOTIFICATION, 95) } catch (_: Exception) { null } }
-    DisposableEffect(Unit) { onDispose { tone?.release() } }
+    val curBatchFinish by rememberUpdatedState(selectedBatchFinish)
+    val curScopeSet by rememberUpdatedState(scopeSet)
 
     fun beepAndVib() {
         try { tone?.startTone(ToneGenerator.TONE_PROP_BEEP, 130) } catch (_: Exception) {}
         try {
-            if (Build.VERSION.SDK_INT >= 31) (ctx.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator.vibrate(VibrationEffect.createOneShot(60, -1))
-            else @Suppress("DEPRECATION") (ctx.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator).vibrate(60)
+            if (Build.VERSION.SDK_INT >= 31) {
+                (ctx.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
+                    .vibrate(VibrationEffect.createOneShot(60, -1))
+            } else {
+                @Suppress("DEPRECATION")
+                (ctx.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator).vibrate(60)
+            }
         } catch (_: Exception) {}
     }
 
-    LaunchedEffect(torch, camCtrl) { try { camCtrl?.cameraControl?.enableTorch(torch) } catch (_: Exception) {} }
-    LaunchedEffect(bannerText) { if (bannerText != null) { delay(1300); bannerText = null } }
+    fun resetDuplicateLock() {
+        lockedCardIdRef.value = ""
+        emptyFramesRef.intValue = 0
+        diffStreakIdRef.value = ""
+        diffStreakCountRef.intValue = 0
+        streakCardIdRef.value = ""
+        streakCountRef.intValue = 0
+        statusText = "Готов к следующей карте"
+    }
+
+    LaunchedEffect(torch, camCtrl) {
+        try { camCtrl?.cameraControl?.enableTorch(torch) } catch (_: Exception) {}
+    }
+    LaunchedEffect(bannerText) {
+        if (bannerText != null) {
+            delay(1300)
+            bannerText = null
+        }
+    }
 
     if (!perm) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -1301,64 +1441,155 @@ fun ScannerOverlayScreen(
             PreviewView(c).apply { layoutParams = ViewGroup.LayoutParams(-1, -1) }.also { pv ->
                 ProcessCameraProvider.getInstance(c).addListener({
                     val prov = ProcessCameraProvider.getInstance(c).get()
+                    cameraProviderRef = prov
                     val prev = Preview.Builder().build().apply { setSurfaceProvider(pv.surfaceProvider) }
-                    val an = ImageAnalysis.Builder().setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build()
-                    val textRec = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+                    val an = ImageAnalysis.Builder()
+                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                        .build()
                     var lastT = 0L
 
-                    an.setAnalyzer(Executors.newSingleThreadExecutor()) { px ->
+                    an.setAnalyzer(analysisExecutor) { px ->
                         val now = System.currentTimeMillis()
-                        if (now - lastT < 220) { px.close(); return@setAnalyzer }
-                        @androidx.camera.core.ExperimentalGetImage val img = px.image
-                        if (img != null) {
-                            lastT = now
-                            val rot = (px.imageInfo.rotationDegrees + curExtraRot) % 360
-                            val crop = extractCardCropBitmap(img, rot)
-                            if (crop != null) {
-                                val (frameHash, frameColor) = CardRecognizer.computeSignature(crop)
-                                val inputImg = InputImage.fromBitmap(crop, 0)
-                                textRec.process(inputImg)
-                                    .addOnSuccessListener { visionText ->
-                                        val match = CardRecognizer.matchCard(
-                                            frameHash = frameHash,
-                                            frameColor = frameColor,
-                                            ocrText = visionText.text,
-                                            candidateSlots = curSlots,
-                                            hashes = curHashes
-                                        )
-                                        if (match == null) {
-                                            streakId = ""
-                                            streakCount = 0
-                                            if (lastAddedCardId.isNotEmpty() && java.lang.Long.bitCount(frameHash xor lastMatchedHash) > 18) {
-                                                lastAddedCardId = ""
-                                                statusText = "Жду следующую карту..."
-                                            }
-                                        } else {
-                                            if (match.cardId == streakId) streakCount++ else { streakId = match.cardId; streakCount = 1 }
-                                            if (streakCount >= 2 && match.cardId != lastAddedCardId) {
-                                                lastAddedCardId = match.cardId
-                                                lastMatchedHash = frameHash
-                                                val defaultSlot = curSlots.firstOrNull { it.cardId == match.cardId && it.finish == "Normal" } ?: match
-                                                scope.launch(Dispatchers.Main) {
-                                                    detectedCard = defaultSlot
-                                                    onIncrementSlot(defaultSlot.slotId)
-                                                    beepAndVib()
-                                                    statusText = "Найдено: ${defaultSlot.name} (${formatCardNumber(defaultSlot.localId, defaultSlot.setTotal)})"
-                                                    bannerText = "+1 ${defaultSlot.name} [${defaultSlot.finish}]"
-                                                }
+                        if (now - lastT < 200) {
+                            px.close()
+                            return@setAnalyzer
+                        }
+                        lastT = now
+
+                        val crop = extractCardCropBitmap(px, curExtraRot)
+                        px.close()
+
+                        if (crop == null) return@setAnalyzer
+
+                        val (frameHash, frameColor) = CardRecognizer.computeSignature(crop)
+                        val cw = crop.width
+                        val ch = crop.height
+
+                        val topH = (ch * 0.22f).toInt().coerceIn(1, ch)
+                        val botTop = (ch * 0.78f).toInt().coerceIn(0, ch - 1)
+                        val botH = (ch - botTop).coerceAtLeast(1)
+                        val botW = (cw * 0.58f).toInt().coerceIn(1, cw)
+
+                        val topCrop = Bitmap.createBitmap(crop, 0, 0, cw, topH)
+                        val botLeftCrop = Bitmap.createBitmap(crop, 0, botTop, botW, botH)
+                        crop.recycle()
+
+                        val topTask = textRecognizer.process(InputImage.fromBitmap(topCrop, 0))
+                        val botTask = textRecognizer.process(InputImage.fromBitmap(botLeftCrop, 0))
+
+                        com.google.android.gms.tasks.Tasks.whenAllComplete(topTask, botTask)
+                            .addOnCompleteListener {
+                                val topText = if (topTask.isSuccessful) topTask.result?.text ?: "" else ""
+                                val botText = if (botTask.isSuccessful) botTask.result?.text ?: "" else ""
+                                topCrop.recycle()
+                                botLeftCrop.recycle()
+
+                                val isFrameEmpty = topText.isBlank() && botText.isBlank()
+                                if (isFrameEmpty) {
+                                    streakCardIdRef.value = ""
+                                    streakCountRef.intValue = 0
+                                    diffStreakIdRef.value = ""
+                                    diffStreakCountRef.intValue = 0
+                                    if (lockedCardIdRef.value.isNotEmpty()) {
+                                        emptyFramesRef.intValue += 1
+                                        if (emptyFramesRef.intValue >= 5) {
+                                            lockedCardIdRef.value = ""
+                                            emptyFramesRef.intValue = 0
+                                            scope.launch(Dispatchers.Main) {
+                                                statusText = "Рамка пуста — готов к следующей"
                                             }
                                         }
                                     }
-                                    .addOnCompleteListener {
-                                        crop.recycle()
-                                        px.close()
+                                    return@addOnCompleteListener
+                                } else {
+                                    emptyFramesRef.intValue = 0
+                                }
+
+                                val matchRes = CardRecognizer.matchCard(
+                                    frameHash = frameHash,
+                                    frameColor = frameColor,
+                                    bottomLeftText = botText,
+                                    topNameText = topText,
+                                    isScopedSet = curScopeSet != null,
+                                    candidateSlots = curSlots,
+                                    hashes = curHashes
+                                )
+
+                                if (matchRes == null) {
+                                    streakCardIdRef.value = ""
+                                    streakCountRef.intValue = 0
+                                    return@addOnCompleteListener
+                                }
+
+                                val matchedId = matchRes.card.cardId
+
+                                if (lockedCardIdRef.value.isNotEmpty()) {
+                                    if (matchedId == lockedCardIdRef.value) {
+                                        diffStreakIdRef.value = ""
+                                        diffStreakCountRef.intValue = 0
+                                        return@addOnCompleteListener
+                                    } else {
+                                        if (diffStreakIdRef.value == matchedId) {
+                                            diffStreakCountRef.intValue += 1
+                                        } else {
+                                            diffStreakIdRef.value = matchedId
+                                            diffStreakCountRef.intValue = 1
+                                        }
+                                        if (diffStreakCountRef.intValue >= 2) {
+                                            lockedCardIdRef.value = ""
+                                            diffStreakIdRef.value = ""
+                                            diffStreakCountRef.intValue = 0
+                                        } else {
+                                            return@addOnCompleteListener
+                                        }
                                     }
-                            } else {
-                                px.close()
+                                }
+
+                                if (streakCardIdRef.value == matchedId) {
+                                    streakCountRef.intValue += 1
+                                } else {
+                                    streakCardIdRef.value = matchedId
+                                    streakCountRef.intValue = 1
+                                }
+
+                                if (streakCountRef.intValue >= 2 && lockedCardIdRef.value != matchedId) {
+                                    lockedCardIdRef.value = matchedId
+                                    streakCardIdRef.value = ""
+                                    streakCountRef.intValue = 0
+
+                                    val cardVariants = curSlots.filter { it.cardId == matchedId }
+                                    val chosenFinish = curBatchFinish
+                                    val resolvedSlot: CardSlot
+                                    val needsCheckFlag: Boolean
+
+                                    if (cardVariants.size == 1) {
+                                        resolvedSlot = cardVariants.first()
+                                        needsCheckFlag = matchRes.needsCheck
+                                    } else {
+                                        val exact = cardVariants.firstOrNull { it.finish == chosenFinish }
+                                        if (exact != null) {
+                                            resolvedSlot = exact
+                                            needsCheckFlag = matchRes.needsCheck
+                                        } else {
+                                            resolvedSlot = cardVariants.firstOrNull() ?: matchRes.card
+                                            needsCheckFlag = true
+                                        }
+                                    }
+
+                                    scope.launch(Dispatchers.Main) {
+                                        val nextUid = uidCounter++
+                                        pendingBatch = pendingBatch + PendingScanItem(
+                                            uid = nextUid,
+                                            slot = resolvedSlot,
+                                            needsCheck = needsCheckFlag
+                                        )
+                                        beepAndVib()
+                                        val tag = if (needsCheckFlag) "проверить" else "ок"
+                                        statusText = "В пачку: ${resolvedSlot.name} (${formatCardNumber(resolvedSlot.localId, resolvedSlot.setTotal)}) [$tag]"
+                                        bannerText = "+ ${resolvedSlot.name} (${resolvedSlot.finish})"
+                                    }
+                                }
                             }
-                        } else {
-                            px.close()
-                        }
                     }
 
                     try {
@@ -1371,17 +1602,17 @@ fun ScannerOverlayScreen(
 
         Canvas(modifier = Modifier.fillMaxSize()) {
             val targetRatio = 2.5f / 3.5f
-            var boxW = size.width * 0.82f
+            var boxW = size.width * 0.78f
             var boxH = boxW / targetRatio
-            if (boxH > size.height * 0.66f) {
-                boxH = size.height * 0.66f
+            if (boxH > size.height * 0.56f) {
+                boxH = size.height * 0.56f
                 boxW = boxH * targetRatio
             }
             val left = (size.width - boxW) / 2f
-            val top = (size.height - boxH) / 2f + size.height * 0.03f
+            val top = (size.height - boxH) / 2f - size.height * 0.03f
 
             drawRoundRect(
-                color = if (lastAddedCardId.isNotEmpty()) AccentTeal else Color.White.copy(alpha = 0.88f),
+                color = if (lockedCardIdRef.value.isNotEmpty()) AccentTeal else Color.White.copy(alpha = 0.88f),
                 topLeft = Offset(left, top),
                 size = Size(boxW, boxH),
                 cornerRadius = CornerRadius(28f, 28f),
@@ -1394,93 +1625,196 @@ fun ScannerOverlayScreen(
                 .align(Alignment.TopCenter)
                 .fillMaxWidth()
                 .statusBarsPadding()
-                .padding(12.dp),
+                .padding(horizontal = 12.dp, vertical = 8.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Surface(color = Color.Black.copy(0.84f), shape = RoundedCornerShape(16.dp)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    IconButton(onClick = onClose, modifier = Modifier.size(38.dp)) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Закрыть", tint = Color.White)
+            Surface(color = Color.Black.copy(0.86f), shape = RoundedCornerShape(16.dp)) {
+                Column(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        IconButton(onClick = onClose, modifier = Modifier.size(36.dp)) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Закрыть", tint = Color.White)
+                        }
+                        Column(Modifier.weight(1f).padding(horizontal = 4.dp)) {
+                            Text(
+                                text = scopeSet?.name ?: "Все сеты (нужен номер XXX/YYY)",
+                                color = AccentTeal,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = statusText,
+                                color = Color.White,
+                                fontSize = 12.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                        IconButton(onClick = { torch = !torch }, modifier = Modifier.size(34.dp)) {
+                            Icon(
+                                if (torch) Icons.Default.FlashOn else Icons.Default.FlashOff,
+                                null,
+                                tint = if (torch) Color(0xFFFFD54F) else Color.White
+                            )
+                        }
+                        IconButton(
+                            onClick = {
+                                extraRot = (extraRot + 90) % 360
+                                resetDuplicateLock()
+                            },
+                            modifier = Modifier.size(34.dp)
+                        ) {
+                            Icon(Icons.Default.RotateRight, null, tint = Color.White)
+                        }
                     }
-                    Column(Modifier.weight(1f).padding(horizontal = 4.dp)) {
-                        Text(
-                            text = scopeSet?.name ?: "Все сеты",
-                            color = AccentTeal,
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        Text(
-                            text = statusText,
-                            color = Color.White,
-                            fontSize = 12.sp,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
-                    IconButton(onClick = { torch = !torch }, modifier = Modifier.size(34.dp)) {
-                        Icon(if (torch) Icons.Default.FlashOn else Icons.Default.FlashOff, null, tint = if (torch) Color(0xFFFFD54F) else Color.White)
-                    }
-                    IconButton(onClick = { extraRot = (extraRot + 90) % 360; lastAddedCardId = "" }, modifier = Modifier.size(34.dp)) {
-                        Icon(Icons.Default.RotateRight, null, tint = Color.White)
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        listOf(
+                            "Normal" to "Normal",
+                            "Reverse Holofoil" to "Reverse",
+                            "Holofoil" to "Holo"
+                        ).forEach { (finishKey, labelText) ->
+                            FilterChip(
+                                selected = selectedBatchFinish == finishKey,
+                                onClick = { selectedBatchFinish = finishKey },
+                                label = { Text(labelText, fontSize = 11.sp) },
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
                     }
                 }
             }
+
             bannerText?.let {
                 Spacer(Modifier.height(6.dp))
                 Surface(color = AccentTeal, shape = RoundedCornerShape(20.dp)) {
-                    Text(it, color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 13.sp, modifier = Modifier.padding(16.dp, 6.dp))
+                    Text(
+                        it,
+                        color = Color.Black,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 12.sp,
+                        modifier = Modifier.padding(14.dp, 5.dp)
+                    )
                 }
             }
         }
 
-        detectedCard?.let { card ->
-            val siblingSlots = remember(card.cardId, candidateSlots) {
-                candidateSlots.filter { it.cardId == card.cardId }
-            }
-            Card(
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = CardSurface),
-                border = BorderStroke(1.dp, AccentTeal),
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .navigationBarsPadding()
-                    .fillMaxWidth()
-                    .padding(14.dp)
+        Column(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .navigationBarsPadding()
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 10.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Row(Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
-                    AsyncImage(
-                        model = card.imageUrl,
-                        contentDescription = card.name,
-                        modifier = Modifier.size(56.dp, 78.dp).clip(RoundedCornerShape(8.dp))
-                    )
-                    Spacer(Modifier.width(10.dp))
-                    Column(Modifier.weight(1f)) {
-                        Text(card.name, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Text("${card.setName} • ${formatCardNumber(card.localId, card.setTotal)}", color = TextMuted, fontSize = 12.sp)
-                        Spacer(Modifier.height(6.dp))
-                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            siblingSlots.forEach { s ->
-                                val q = quantities[s.slotId] ?: 0
-                                FilterChip(
-                                    selected = q > 0,
-                                    onClick = {
-                                        onIncrementSlot(s.slotId)
-                                        beepAndVib()
-                                        bannerText = "+1 ${s.name} [${s.finish}]"
-                                    },
-                                    label = {
-                                        Text(
-                                            text = "${if (s.finish == "Reverse Holofoil") "Reverse" else s.finish} ($q)",
-                                            fontSize = 11.sp
-                                        )
+                Button(
+                    onClick = { resetDuplicateLock() },
+                    colors = ButtonDefaults.buttonColors(containerColor = CardSurface),
+                    border = BorderStroke(1.dp, BorderGray),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.weight(1f).height(40.dp)
+                ) {
+                    Text("Следующая", color = Color.White, fontSize = 12.sp)
+                }
+                Button(
+                    onClick = {
+                        if (pendingBatch.isNotEmpty()) {
+                            pendingBatch = pendingBatch.dropLast(1)
+                            resetDuplicateLock()
+                        }
+                    },
+                    enabled = pendingBatch.isNotEmpty(),
+                    colors = ButtonDefaults.buttonColors(containerColor = CardSurface),
+                    border = BorderStroke(1.dp, BorderGray),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.weight(1f).height(40.dp)
+                ) {
+                    Text("Отменить последнюю", color = Color.White, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
+
+            if (pendingBatch.isNotEmpty()) {
+                Spacer(Modifier.height(6.dp))
+                Card(
+                    shape = RoundedCornerShape(14.dp),
+                    colors = CardDefaults.cardColors(containerColor = CardSurface.copy(alpha = 0.94f)),
+                    border = BorderStroke(1.dp, BorderGray),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(Modifier.padding(8.dp)) {
+                        LazyColumn(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 135.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            itemsIndexed(pendingBatch, key = { _, item -> item.uid }) { _, item ->
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .background(BgBlack.copy(alpha = 0.6f), RoundedCornerShape(8.dp))
+                                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = "${item.slot.name} • ${formatCardNumber(item.slot.localId, item.slot.setTotal)}",
+                                        color = Color.White,
+                                        fontSize = 12.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(
+                                        text = if (item.slot.finish == "Reverse Holofoil") "Reverse" else item.slot.finish,
+                                        color = AccentTeal,
+                                        fontSize = 11.sp
+                                    )
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(
+                                        text = if (item.needsCheck) "проверить" else "ок",
+                                        color = if (item.needsCheck) Color(0xFFFFB74D) else Color(0xFF81C784),
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                    IconButton(
+                                        onClick = { pendingBatch = pendingBatch.filterNot { it.uid == item.uid } },
+                                        modifier = Modifier.size(26.dp)
+                                    ) {
+                                        Icon(Icons.Default.Close, contentDescription = "Убрать", tint = TextMuted, modifier = Modifier.size(14.dp))
                                     }
-                                )
+                                }
                             }
+                        }
+
+                        Spacer(Modifier.height(6.dp))
+
+                        Button(
+                            onClick = {
+                                val toCommit = pendingBatch
+                                toCommit.forEach { onIncrementSlot(it.slot.slotId) }
+                                pendingBatch = emptyList()
+                                resetDuplicateLock()
+                                beepAndVib()
+                                bannerText = "Добавлено в библиотеку: ${toCommit.size}"
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = AccentTeal),
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier.fillMaxWidth().height(40.dp)
+                        ) {
+                            Text(
+                                text = "Добавить в библиотеку (${pendingBatch.size})",
+                                color = Color.Black,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp
+                            )
                         }
                     }
                 }
