@@ -747,7 +747,11 @@ fun SetDetailScreen(
     var errorText by remember { mutableStateOf<String?>(null) }
 
     val gridState = rememberLazyGridState()
-    val scope = rememberCoroutineScope()
+
+    // Сбрасываем скролл в самый верх ПОСЛЕ того, как список перестроился с новой сортировкой или фильтром
+    LaunchedEffect(sortAscending, filterMode) {
+        gridState.scrollToItem(0)
+    }
 
     LaunchedEffect(set.id) {
         if (slots.isEmpty()) {
@@ -858,7 +862,6 @@ fun SetDetailScreen(
                         onClick = {
                             sortAscending = true
                             showSortMenu = false
-                            scope.launch { gridState.scrollToItem(0) }
                         }
                     )
                     DropdownMenuItem(
@@ -866,7 +869,6 @@ fun SetDetailScreen(
                         onClick = {
                             sortAscending = false
                             showSortMenu = false
-                            scope.launch { gridState.scrollToItem(0) }
                         }
                     )
                     HorizontalDivider(color = BorderGray)
@@ -875,7 +877,6 @@ fun SetDetailScreen(
                         onClick = {
                             filterMode = "ALL"
                             showSortMenu = false
-                            scope.launch { gridState.scrollToItem(0) }
                         }
                     )
                     DropdownMenuItem(
@@ -883,7 +884,6 @@ fun SetDetailScreen(
                         onClick = {
                             filterMode = "OWNED"
                             showSortMenu = false
-                            scope.launch { gridState.scrollToItem(0) }
                         }
                     )
                     DropdownMenuItem(
@@ -891,7 +891,6 @@ fun SetDetailScreen(
                         onClick = {
                             filterMode = "MISSING"
                             showSortMenu = false
-                            scope.launch { gridState.scrollToItem(0) }
                         }
                     )
                 }
