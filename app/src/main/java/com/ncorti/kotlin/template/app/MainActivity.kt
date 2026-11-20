@@ -2,7 +2,6 @@ package com.ncorti.kotlin.template.app
 
 import android.Manifest
 import android.content.Context
-import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -22,35 +21,39 @@ import android.os.VibratorManager
 import android.view.ViewGroup
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.graphics.ColorMatrix
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -65,6 +68,9 @@ import coil.compose.AsyncImage
 import com.google.gson.Gson
 import com.google.gson.JsonParser
 import com.google.gson.reflect.TypeToken
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -76,88 +82,170 @@ import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import retrofit2.Retrofit
-import retrofit2.converter.gson.GsonConverterFactory
-import retrofit2.http.GET
-import retrofit2.http.Query
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 
-data class ApiResponse(val data: List<PokemonCardDto>)
-data class SetsApiResponse(val data: List<RemoteSetDto>)
-data class RemoteSetDto(
+// --- Data Models ---
+data class TcgSet(
     val id: String,
     val name: String,
-    val series: String? = null,
-    val ptcgoCode: String? = null,
-    val total: Int? = null,
-    val releaseDate: String? = null
+    val logoUrl: String?,
+    val releaseDate: String?,
+    val totalCards: Int
 )
 
-data class PokemonCardDto(val id: String, val name: String, val number: String, val set: CardSetDto, val images: CardImagesDto)
-data class CardSetDto(val id: String? = null, val name: String)
-data class CardImagesDto(val small: String, val large: String)
-
-data class CollectedCard(
-    val id: String,
-    val name: String,
-    val number: String,
-    val setName: String,
-    val imageUrl: String,
-    val count: Int,
-    val finish: String? = "Normal"
-)
-
-data class HashedCard(
-    val id: String,
-    val name: String,
-    val number: String,
+data class CardSlot(
+    val slotId: String,       // e.g. "sv03.5-001::Normal"
+    val cardId: String,       // e.g. "sv03.5-001"
     val setId: String,
     val setName: String,
-    val imageUrl: String,
+    val name: String,
+    val localId: String,      // e.g. "001"
+    val setTotal: Int,
+    val rarity: String,
+    val finish: String,       // "Normal", "Reverse Holofoil", "Holofoil"
+    val imageUrl: String
+)
+
+data class CardHashEntry(
+    val cardId: String,
+    val setId: String,
     val dHash: Long,
     val colorSig: IntArray
-) {
-    fun toDto() = PokemonCardDto(id, name, number, CardSetDto(setId, setName), CardImagesDto(imageUrl, imageUrl))
-}
+)
 
-interface PokemonTcgApi {
-    @GET("v2/cards")
-    suspend fun getCardsBySet(
-        @Query("q") q: String,
-        @Query("pageSize") ps: Int = 50,
-        @Query("page") page: Int = 1
-    ): ApiResponse
-
-    @GET("v2/sets")
-    suspend fun getAllSets(
-        @Query("pageSize") ps: Int = 250,
-        @Query("page") page: Int = 1,
-        @Query("orderBy") orderBy: String = "-releaseDate"
-    ): SetsApiResponse
-}
-
-object ApiClient {
+object NetClient {
     val okHttp: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(25, TimeUnit.SECONDS)
         .build()
+}
 
-    val api: PokemonTcgApi by lazy {
-        Retrofit.Builder()
-            .baseUrl("https://api.pokemontcg.io/")
-            .client(okHttp)
-            .addConverterFactory(GsonConverterFactory.create())
-            .build()
-            .create(PokemonTcgApi::class.java)
+// --- TCGdex API Service ---
+object TcgDexRepository {
+    suspend fun fetchAllSets(): List<TcgSet> = withContext(Dispatchers.IO) {
+        val req = Request.Builder().url("https://api.tcgdex.net/v2/en/sets").build()
+        NetClient.okHttp.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) throw Exception("HTTP ${resp.code}")
+            val body = resp.body?.string() ?: return@withContext emptyList()
+            val arr = JsonParser.parseString(body).asJsonArray
+            val list = mutableListOf<TcgSet>()
+            for (el in arr) {
+                val obj = el.asJsonObject
+                val id = obj.get("id")?.takeIf { !it.isJsonNull }?.asString ?: continue
+                val name = obj.get("name")?.takeIf { !it.isJsonNull }?.asString ?: continue
+                val logoRaw = obj.get("logo")?.takeIf { !it.isJsonNull }?.asString
+                val logoUrl = logoRaw?.let { "$it.webp" }
+                val releaseDate = obj.get("releaseDate")?.takeIf { !it.isJsonNull }?.asString
+                val cardCountObj = obj.getAsJsonObject("cardCount")
+                val total = cardCountObj?.get("total")?.takeIf { !it.isJsonNull }?.asInt
+                    ?: cardCountObj?.get("official")?.takeIf { !it.isJsonNull }?.asInt ?: 0
+                if (total > 0) {
+                    list.add(TcgSet(id, name, logoUrl, releaseDate, total))
+                }
+            }
+            list.sortedByDescending { it.releaseDate ?: "" }
+        }
+    }
+
+    suspend fun fetchSetSlots(set: TcgSet): List<CardSlot> = withContext(Dispatchers.IO) {
+        val req = Request.Builder().url("https://api.tcgdex.net/v2/en/sets/${set.id}").build()
+        NetClient.okHttp.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) throw Exception("HTTP ${resp.code}")
+            val body = resp.body?.string() ?: return@withContext emptyList()
+            val root = JsonParser.parseString(body).asJsonObject
+            val setName = root.get("name")?.takeIf { !it.isJsonNull }?.asString ?: set.name
+            val cardCountObj = root.getAsJsonObject("cardCount")
+            val officialTotal = cardCountObj?.get("official")?.takeIf { !it.isJsonNull }?.asInt ?: set.totalCards
+            val cardsArr = root.getAsJsonArray("cards") ?: return@withContext emptyList()
+
+            val slots = mutableListOf<CardSlot>()
+            for (el in cardsArr) {
+                val obj = el.asJsonObject
+                val cid = obj.get("id")?.takeIf { !it.isJsonNull }?.asString ?: continue
+                val cname = obj.get("name")?.takeIf { !it.isJsonNull }?.asString ?: continue
+                val localId = obj.get("localId")?.takeIf { !it.isJsonNull }?.asString ?: ""
+                val imgBase = obj.get("image")?.takeIf { !it.isJsonNull }?.asString ?: continue
+                val imageUrl = "$imgBase/low.webp"
+                val rarity = obj.get("rarity")?.takeIf { !it.isJsonNull }?.asString ?: "Common"
+
+                val variantsObj = obj.getAsJsonObject("variants")
+                val finishes = mutableListOf<String>()
+                if (variantsObj != null) {
+                    if (variantsObj.get("normal")?.takeIf { !it.isJsonNull }?.asBoolean == true) finishes.add("Normal")
+                    if (variantsObj.get("reverse")?.takeIf { !it.isJsonNull }?.asBoolean == true) finishes.add("Reverse Holofoil")
+                    if (variantsObj.get("holo")?.takeIf { !it.isJsonNull }?.asBoolean == true) finishes.add("Holofoil")
+                }
+                if (finishes.isEmpty()) {
+                    val rLow = rarity.lowercase()
+                    if (rLow.contains("rare") && rLow != "rare") finishes.add("Holofoil")
+                    else finishes.add("Normal")
+                }
+
+                for (fin in finishes) {
+                    slots.add(
+                        CardSlot(
+                            slotId = "$cid::$fin",
+                            cardId = cid,
+                            setId = set.id,
+                            setName = setName,
+                            name = cname,
+                            localId = localId,
+                            setTotal = officialTotal,
+                            rarity = rarity,
+                            finish = fin,
+                            imageUrl = imageUrl
+                        )
+                    )
+                }
+            }
+            slots
+        }
     }
 }
 
-// --- Visual Hashing Engine (dHash 64-bit + RGB Color Grid) ---
-object VisualMatcher {
+// --- Local Storage ---
+class LocalStore(ctx: Context) {
+    private val gson = Gson()
+    private val qtyFile = File(ctx.filesDir, "tcg_quantities_v1.json")
+    private val setsFile = File(ctx.filesDir, "tcg_sets_v1.json")
+    private val slotsFile = File(ctx.filesDir, "tcg_slots_v1.json")
+    private val hashFile = File(ctx.filesDir, "tcg_hashes_v1.json")
+
+    fun loadQuantities(): Map<String, Int> = try {
+        if (!qtyFile.exists()) emptyMap()
+        else gson.fromJson(qtyFile.readText(), object : TypeToken>() {}.type) ?: emptyMap()
+    } catch (_: Exception) { emptyMap() }
+
+    fun saveQuantities(map: Map<String, Int>) = qtyFile.writeText(gson.toJson(map))
+
+    fun loadSets(): List<TcgSet> = try {
+        if (!setsFile.exists()) emptyList()
+        else gson.fromJson(setsFile.readText(), object : TypeToken<List<TcgSet>>() {}.type) ?: emptyList()
+    } catch (_: Exception) { emptyList() }
+
+    fun saveSets(sets: List<TcgSet>) = setsFile.writeText(gson.toJson(sets))
+
+    fun loadAllSlots(): Map<String, List<CardSlot>> = try {
+        if (!slotsFile.exists()) emptyMap()
+        else gson.fromJson(slotsFile.readText(), object : TypeToken>>() {}.type) ?: emptyMap()
+    } catch (_: Exception) { emptyMap() }
+
+    fun saveAllSlots(map: Map<String, List<CardSlot>>) = slotsFile.writeText(gson.toJson(map))
+
+    fun loadHashes(): Map<String, CardHashEntry> = try {
+        if (!hashFile.exists()) emptyMap()
+        else gson.fromJson(hashFile.readText(), object : TypeToken>() {}.type) ?: emptyMap()
+    } catch (_: Exception) { emptyMap() }
+
+    fun saveHashes(map: Map<String, CardHashEntry>) = hashFile.writeText(gson.toJson(map))
+}
+
+// --- Visual Matcher + OCR Assist ---
+object CardRecognizer {
     fun computeSignature(bmp: Bitmap): Pair<Long, IntArray> {
         val gray = Bitmap.createScaledBitmap(bmp, 9, 8, true)
         var hash = 0L
@@ -168,9 +256,7 @@ object VisualMatcher {
                 val p2 = gray.getPixel(x + 1, y)
                 val l1 = (AndroidColor.red(p1) * 77 + AndroidColor.green(p1) * 150 + AndroidColor.blue(p1) * 29) shr 8
                 val l2 = (AndroidColor.red(p2) * 77 + AndroidColor.green(p2) * 150 + AndroidColor.blue(p2) * 29) shr 8
-                if (l1 > l2) {
-                    hash = hash or (1L shl bit)
-                }
+                if (l1 > l2) hash = hash or (1L shl bit)
                 bit++
             }
         }
@@ -191,163 +277,766 @@ object VisualMatcher {
         return hash to sig
     }
 
-    fun findBestMatch(
+    fun matchCard(
         frameHash: Long,
         frameColor: IntArray,
-        db: List<HashedCard>,
-        activeSetFilter: String? = null
-    ): Pair<HashedCard, Int>? {
-        if (db.isEmpty()) return null
-        val pool = if (activeSetFilter != null) {
-            db.filter { it.setId == activeSetFilter }.ifEmpty { db }
-        } else db
+        ocrText: String,
+        candidateSlots: List<CardSlot>,
+        hashes: Map<String, CardHashEntry>
+    ): CardSlot? {
+        if (candidateSlots.isEmpty()) return null
+        val uniqueCards = candidateSlots.distinctBy { it.cardId }
 
-        var bestCard: HashedCard? = null
+        // 1. Проверяем, прочитался ли номер карты (например, 001/084 или 17/86) или точное имя в рамках этого пула
+        val ocrClean = ocrText.replace('O', '0').replace('o', '0').replace('I', '1').replace('l', '1')
+        val slashMatch = Regex("""\b(\d{1,3})\s*/\s*\d{2,3}\b""").find(ocrClean)
+        val detectedNum = slashMatch?.groupValues?.get(1)?.trimStart('0')?.ifEmpty { "0" }
+        val ocrLower = ocrText.lowercase()
+
+        var bestCard: CardSlot? = null
         var bestScore = Int.MAX_VALUE
 
-        for (c in pool) {
-            val hamming = java.lang.Long.bitCount(frameHash xor c.dHash)
-            if (hamming > 22) continue
-
+        for (card in uniqueCards) {
+            val hEntry = hashes[card.cardId]
+            val hamming = if (hEntry != null) java.lang.Long.bitCount(frameHash xor hEntry.dHash) else 16
             var colorDiff = 0
-            val cSig = c.colorSig
-            if (cSig.size == 48) {
-                for (i in 0 until 48) {
-                    colorDiff += abs(frameColor[i] - cSig[i])
-                }
+            if (hEntry != null && hEntry.colorSig.size == 48) {
+                for (i in 0 until 48) colorDiff += abs(frameColor[i] - hEntry.colorSig[i])
+            } else {
+                colorDiff = 25 * 48
             }
-            val score = hamming * 35 + (colorDiff / 48)
+
+            var score = hamming * 35 + (colorDiff / 48)
+
+            // Бонус за совпадение номера в OCR
+            val cardNumClean = card.localId.trimStart('0').ifEmpty { "0" }
+            if (detectedNum != null && detectedNum == cardNumClean) {
+                score -= 260
+            }
+            // Бонус за совпадение имени покемона в OCR
+            if (card.name.length >= 4 && ocrLower.contains(card.name.lowercase())) {
+                score -= 220
+            }
+
             if (score < bestScore) {
                 bestScore = score
-                bestCard = c
+                bestCard = card
             }
         }
 
-        return if (bestCard != null && bestScore <= 620) bestCard to bestScore else null
+        return if (bestCard != null && bestScore <= 580) bestCard else null
     }
 }
 
-class CollectionRepository(ctx: Context) {
-    private val cf = File(ctx.filesDir, "pokemon_collection.json")
-    private val ff = File(ctx.filesDir, "custom_folders.json")
-    private val hf = File(ctx.filesDir, "visual_hashes_v1.json")
-    private val sf = File(ctx.filesDir, "all_sets_cache.json")
-    private val gson = Gson()
-
-    fun loadCards(): List<CollectedCard> = try {
-        if (!cf.exists()) emptyList()
-        else gson.fromJson(cf.readText(), object : TypeToken<List<CollectedCard>>() {}.type) ?: emptyList()
-    } catch (_: Exception) { emptyList() }
-
-    fun saveCards(c: List<CollectedCard>) = cf.writeText(gson.toJson(c))
-
-    fun loadFolders(): List<String> = try {
-        if (!ff.exists()) emptyList()
-        else gson.fromJson(ff.readText(), object : TypeToken<List<String>>() {}.type) ?: emptyList()
-    } catch (_: Exception) { emptyList() }
-
-    fun saveFolders(f: List<String>) = ff.writeText(gson.toJson(f))
-
-    fun loadHashes(): List<HashedCard> = try {
-        if (!hf.exists()) emptyList()
-        else gson.fromJson(hf.readText(), object : TypeToken<List<HashedCard>>() {}.type) ?: emptyList()
-    } catch (_: Exception) { emptyList() }
-
-    fun saveHashes(h: List<HashedCard>) = hf.writeText(gson.toJson(h))
-
-    fun loadSetsCache(): List<RemoteSetDto> = try {
-        if (!sf.exists()) emptyList()
-        else gson.fromJson(sf.readText(), object : TypeToken<List<RemoteSetDto>>() {}.type) ?: emptyList()
-    } catch (_: Exception) { emptyList() }
-
-    fun saveSetsCache(s: List<RemoteSetDto>) = sf.writeText(gson.toJson(s))
+fun numericCardOrder(localId: String): Int {
+    val digits = localId.filter { it.isDigit() }
+    val base = digits.toIntOrNull() ?: 9999
+    val hasPrefix = localId.firstOrNull()?.isLetter() == true
+    return if (hasPrefix) 10000 + base else base
 }
+
+fun formatCardNumber(localId: String, total: Int): String {
+    val paddedLocal = if (localId.all { it.isDigit() } && localId.length < 3) localId.padStart(3, '0') else localId
+    val paddedTotal = total.toString().padStart(3, '0')
+    return "$paddedLocal/$paddedTotal"
+}
+
+// --- Theme Colors ---
+val BgBlack = Color(0xFF0B0D0E)
+val CardSurface = Color(0xFF141719)
+val BorderGray = Color(0xFF262B2E)
+val AccentTeal = Color(0xFF36B3A8)
+val TextMuted = Color(0xFF8E969C)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        setContent { MaterialTheme(colorScheme = darkColorScheme()) { PokeCollectorApp() } }
+        setContent {
+            MaterialTheme(
+                colorScheme = darkColorScheme(
+                    background = BgBlack,
+                    surface = CardSurface,
+                    primary = AccentTeal
+                )
+            ) {
+                Surface(Modifier.fillMaxSize(), color = BgBlack) {
+                    PokemonCatalogApp()
+                }
+            }
+        }
     }
 }
 
 @Composable
-fun PokeCollectorApp() {
+fun PokemonCatalogApp() {
     val ctx = LocalContext.current
-    val repo = remember { CollectionRepository(ctx) }
-    var cards by remember { mutableStateOf(repo.loadCards()) }
-    var folders by remember { mutableStateOf(repo.loadFolders()) }
-    var visualDb by remember { mutableStateOf(repo.loadHashes()) }
-    var allSets by remember { mutableStateOf(repo.loadSetsCache()) }
-    var scanFolder by remember { mutableStateOf<String?>(null) }
-    var tab by remember { mutableIntStateOf(0) }
+    val store = remember { LocalStore(ctx) }
+    val scope = rememberCoroutineScope()
+
+    var sets by remember { mutableStateOf(store.loadSets()) }
+    var slotsBySet by remember { mutableStateOf(store.loadAllSlots()) }
+    var quantities by remember { mutableStateOf(store.loadQuantities()) }
+    var hashes by remember { mutableStateOf(store.loadHashes()) }
+
+    var activeSet by remember { mutableStateOf<TcgSet?>(null) }
+    var scannerScopeSet by remember { mutableStateOf<TcgSet?>(null) }
+    var isScannerOpen by remember { mutableStateOf(false) }
+    var loadingSets by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
+        if (sets.isEmpty()) loadingSets = true
         try {
-            val fetched = withContext(Dispatchers.IO) {
-                val res = mutableListOf<RemoteSetDto>()
-                var p = 1
-                while (true) {
-                    val r = ApiClient.api.getAllSets(250, p)
-                    res.addAll(r.data)
-                    if (r.data.size < 250) break
-                    p++
-                }
-                res
+            val remote = TcgDexRepository.fetchAllSets()
+            if (remote.isNotEmpty()) {
+                sets = remote
+                store.saveSets(remote)
             }
-            if (fetched.isNotEmpty()) {
-                allSets = fetched
-                repo.saveSetsCache(fetched)
-            }
-        } catch (_: Exception) {}
-    }
-
-    fun upd(l: List<CollectedCard>) { cards = l; repo.saveCards(l) }
-    fun addF(n: String) { val c = n.trim(); if (c.isNotEmpty() && !folders.contains(c)) { folders = folders + c; repo.saveFolders(folders) } }
-    fun delF(n: String) { folders = folders.filter { it != n }; repo.saveFolders(folders); if (scanFolder == n) scanFolder = null }
-    fun addC(c: PokemonCardDto, tf: String?, finish: String) {
-        val set = tf ?: c.set.name; val eid = "${c.id}::$set::$finish"; val ex = cards.find { it.id == eid }
-        upd(if (ex != null) cards.map { if (it.id == eid) it.copy(count = it.count + 1) else it } else listOf(CollectedCard(eid, c.name, c.number, set, c.images.small, 1, finish)) + cards)
-    }
-    fun movC(cid: String, nf: String) {
-        val t = cards.find { it.id == cid } ?: return; if (t.setName == nf) return
-        val fin = t.finish ?: "Normal"
-        val nid = "${t.id.substringBefore("::")}::$nf::$fin"; val ex = cards.find { it.id == nid }
-        upd(if (ex != null) cards.filter { it.id != cid }.map { if (it.id == nid) it.copy(count = it.count + t.count) else it } else cards.map { if (it.id == cid) it.copy(id = nid, setName = nf) else it })
-    }
-    fun chgFin(cid: String) {
-        val t = cards.find { it.id == cid } ?: return
-        val order = listOf("Normal", "Reverse", "Holo")
-        val nextFin = order[(order.indexOf(t.finish ?: "Normal") + 1) % order.size]
-        val nid = "${t.id.substringBefore("::")}::${t.setName}::$nextFin"; val ex = cards.find { it.id == nid }
-        upd(if (ex != null) cards.filter { it.id != cid }.map { if (it.id == nid) it.copy(count = it.count + t.count) else it } else cards.map { if (it.id == cid) it.copy(id = nid, finish = nextFin) else it })
-    }
-
-    Scaffold(bottomBar = {
-        NavigationBar {
-            NavigationBarItem(tab == 0, { tab = 0 }, { Icon(Icons.Default.QrCodeScanner, null) }, label = { Text("Сканер ∞") })
-            NavigationBarItem(tab == 1, { tab = 1 }, { Icon(Icons.Default.CollectionsBookmark, null) }, label = { Text("Коллекция (${cards.sumOf { it.count }})") })
+        } catch (_: Exception) {
+        } finally {
+            loadingSets = false
         }
-    }) { p ->
-        Box(Modifier.padding(p).fillMaxSize()) {
-            if (tab == 0) ScannerScreen(
-                folders = folders,
-                activeFolder = scanFolder,
-                visualDb = visualDb,
-                allSets = allSets,
-                onSetsLoaded = { s -> allSets = s; repo.saveSetsCache(s) },
-                onUpdateDb = { newDb -> visualDb = newDb; repo.saveHashes(newDb) },
-                onSelFolder = { scanFolder = it },
-                onNewFolder = ::addF,
-                onAdded = { c, fin -> addC(c, scanFolder, fin) }
+    }
+
+    fun changeQty(slotId: String, delta: Int) {
+        val cur = quantities[slotId] ?: 0
+        val next = (cur + delta).coerceAtLeast(0)
+        val updated = if (next == 0) quantities - slotId else quantities + (slotId to next)
+        quantities = updated
+        store.saveQuantities(updated)
+    }
+
+    fun ensureHashesForSlots(slots: List<CardSlot>) {
+        val missing = slots.distinctBy { it.cardId }.filter { !hashes.containsKey(it.cardId) }
+        if (missing.isEmpty()) return
+        scope.launch(Dispatchers.IO) {
+            val sem = Semaphore(8)
+            val newEntries = coroutineScope {
+                missing.map { slot ->
+                    async {
+                        sem.withPermit {
+                            try {
+                                val req = Request.Builder().url(slot.imageUrl).build()
+                                NetClient.okHttp.newCall(req).execute().use { r ->
+                                    val bytes = r.body?.bytes()
+                                    if (bytes != null) {
+                                        val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                                        if (bmp != null) {
+                                            val (dHash, colorSig) = CardRecognizer.computeSignature(bmp)
+                                            bmp.recycle()
+                                            return@withPermit CardHashEntry(slot.cardId, slot.setId, dHash, colorSig)
+                                        }
+                                    }
+                                }
+                            } catch (_: Exception) {}
+                            null
+                        }
+                    }
+                }.awaitAll().filterNotNull()
+            }
+            if (newEntries.isNotEmpty()) {
+                withContext(Dispatchers.Main) {
+                    val merged = hashes + newEntries.associateBy { it.cardId }
+                    hashes = merged
+                    store.saveHashes(merged)
+                }
+            }
+        }
+    }
+
+    if (isScannerOpen) {
+        BackHandler { isScannerOpen = false }
+        val scopedSlots = remember(scannerScopeSet, slotsBySet) {
+            val target = scannerScopeSet
+            if (target != null) {
+                slotsBySet[target.id] ?: emptyList()
+            } else {
+                slotsBySet.values.flatten()
+            }
+        }
+        ScannerOverlayScreen(
+            scopeSet = scannerScopeSet,
+            candidateSlots = scopedSlots,
+            quantities = quantities,
+            hashes = hashes,
+            onIncrementSlot = { slotId -> changeQty(slotId, 1) },
+            onClose = { isScannerOpen = false }
+        )
+        return
+    }
+
+    val currentSet = activeSet
+    if (currentSet != null) {
+        BackHandler { activeSet = null }
+        SetDetailScreen(
+            set = currentSet,
+            slots = slotsBySet[currentSet.id] ?: emptyList(),
+            quantities = quantities,
+            onSlotsLoaded = { loaded ->
+                val updated = slotsBySet + (currentSet.id to loaded)
+                slotsBySet = updated
+                store.saveAllSlots(updated)
+                ensureHashesForSlots(loaded)
+            },
+            onIncrement = { slotId -> changeQty(slotId, 1) },
+            onDecrement = { slotId -> changeQty(slotId, -1) },
+            onOpenScanner = {
+                scannerScopeSet = currentSet
+                isScannerOpen = true
+            },
+            onBack = { activeSet = null }
+        )
+    } else {
+        SetsCatalogScreen(
+            sets = sets,
+            slotsBySet = slotsBySet,
+            quantities = quantities,
+            isLoading = loadingSets,
+            onSelectSet = { s -> activeSet = s },
+            onIncrementSlot = { slotId -> changeQty(slotId, 1) },
+            onDecrementSlot = { slotId -> changeQty(slotId, -1) },
+            onOpenGlobalScanner = {
+                scannerScopeSet = null
+                isScannerOpen = true
+            }
+        )
+    }
+}
+
+// --- Screen 1: Sets Catalog + Global Search ---
+@Composable
+fun SetsCatalogScreen(
+    sets: List<TcgSet>,
+    slotsBySet: Map<String, List<CardSlot>>,
+    quantities: Map<String, Int>,
+    isLoading: Boolean,
+    onSelectSet: (TcgSet) -> Unit,
+    onIncrementSlot: (String) -> Unit,
+    onDecrementSlot: (String) -> Unit,
+    onOpenGlobalScanner: () -> Unit
+) {
+    var query by remember { mutableStateOf("") }
+    var searchAllCardsMode by remember { mutableStateOf(false) }
+
+    val filteredSets = remember(sets, query) {
+        if (query.isBlank()) sets
+        else sets.filter {
+            it.name.contains(query, ignoreCase = true) || it.id.contains(query, ignoreCase = true)
+        }
+    }
+
+    val globalCardResults = remember(slotsBySet, query, searchAllCardsMode) {
+        if (!searchAllCardsMode || query.isBlank()) emptyList()
+        else slotsBySet.values.flatten().filter {
+            it.name.contains(query, ignoreCase = true) || it.localId.contains(query, ignoreCase = true)
+        }.take(80)
+    }
+
+    Column(Modifier.fillMaxSize().background(BgBlack).padding(horizontal = 14.dp, vertical = 10.dp)) {
+        Text("Pokemon Sets", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(10.dp))
+
+        // Поле поиска + значок камеры рядом
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+            OutlinedTextField(
+                value = query,
+                onValueChange = { query = it },
+                placeholder = {
+                    Text(
+                        if (searchAllCardsMode) "Поиск карты во всех сетах..." else "Search by sets",
+                        color = TextMuted,
+                        fontSize = 14.sp
+                    )
+                },
+                leadingIcon = { Icon(Icons.Default.Search, null, tint = Color.White) },
+                trailingIcon = {
+                    if (query.isNotEmpty()) {
+                        IconButton(onClick = { query = "" }) {
+                            Icon(Icons.Default.Close, null, tint = Color.White)
+                        }
+                    }
+                },
+                singleLine = true,
+                shape = RoundedCornerShape(24.dp),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = AccentTeal,
+                    unfocusedBorderColor = BorderGray,
+                    focusedContainerColor = CardSurface,
+                    unfocusedContainerColor = CardSurface
+                ),
+                modifier = Modifier.weight(1f)
             )
-            else CollectionScreen(cards, folders, ::addF, ::delF, ::movC, ::chgFin,
-                { id -> upd(cards.map { if (it.id == id) it.copy(count = it.count + 1) else it }) },
-                { id -> upd(cards.mapNotNull { if (it.id != id) it else if (it.count > 1) it.copy(count = it.count - 1) else null }) })
+            Spacer(Modifier.width(10.dp))
+            Box(
+                modifier = Modifier
+                    .size(48.dp)
+                    .clip(CircleShape)
+                    .background(CardSurface)
+                    .border(1.dp, BorderGray, CircleShape)
+                    .clickable { onOpenGlobalScanner() },
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(Icons.Default.PhotoCamera, contentDescription = "Сканер по всем сетам", tint = Color.White)
+            }
+        }
+
+        Spacer(Modifier.height(8.dp))
+
+        // Переключатель: искать сеты или карты во всех сетах
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FilterChip(
+                selected = !searchAllCardsMode,
+                onClick = { searchAllCardsMode = false },
+                label = { Text("Сеты (${sets.size})", fontSize = 12.sp) }
+            )
+            FilterChip(
+                selected = searchAllCardsMode,
+                onClick = { searchAllCardsMode = true },
+                label = { Text("Поиск карт по всем сетам", fontSize = 12.sp) }
+            )
+        }
+
+        Spacer(Modifier.height(8.dp))
+
+        if (isLoading && sets.isEmpty()) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator(color = AccentTeal)
+            }
+        } else if (searchAllCardsMode) {
+            if (query.isBlank()) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("Введите имя покемона или номер карты", color = TextMuted, fontSize = 14.sp)
+                }
+            } else if (globalCardResults.isEmpty()) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("Ничего не найдено (откройте нужные сеты хотя бы раз)", color = TextMuted, fontSize = 13.sp)
+                }
+            } else {
+                LazyVerticalGrid(
+                    columns = GridCells.Fixed(2),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    items(globalCardResults, key = { it.slotId }) { slot ->
+                        val qty = quantities[slot.slotId] ?: 0
+                        CardGridItem(
+                            slot = slot,
+                            qty = qty,
+                            onIncrement = { onIncrementSlot(slot.slotId) },
+                            onDecrement = { onDecrementSlot(slot.slotId) }
+                        )
+                    }
+                }
+            }
+        } else {
+            LazyVerticalGrid(
+                columns = GridCells.Fixed(2),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                items(filteredSets, key = { it.id }) { set ->
+                    val setSlots = slotsBySet[set.id]
+                    val totalSlots = setSlots?.size ?: set.totalCards
+                    val collectedCount = setSlots?.count { (quantities[it.slotId] ?: 0) > 0 } ?: 0
+                    val progress = if (totalSlots > 0) (collectedCount.toFloat() / totalSlots).coerceIn(0f, 1f) else 0f
+
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onSelectSet(set) },
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(104.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(Color(0xFF1B1E20))
+                                .border(1.dp, BorderGray, RoundedCornerShape(12.dp))
+                        ) {
+                            if (set.logoUrl != null) {
+                                AsyncImage(
+                                    model = set.logoUrl,
+                                    contentDescription = set.name,
+                                    contentScale = ContentScale.Fit,
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .padding(horizontal = 14.dp, vertical = 18.dp)
+                                )
+                            } else {
+                                Text(
+                                    text = set.name,
+                                    color = Color.White,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 13.sp,
+                                    modifier = Modifier.align(Alignment.Center).padding(8.dp)
+                                )
+                            }
+
+                            if (!set.releaseDate.isNullOrBlank()) {
+                                Box(
+                                    modifier = Modifier
+                                        .align(Alignment.TopEnd)
+                                        .padding(6.dp)
+                                        .background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(6.dp))
+                                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                                ) {
+                                    Text(set.releaseDate, color = Color(0xFFB0B8BE), fontSize = 10.sp)
+                                }
+                            }
+
+                            if (collectedCount > 0) {
+                                Box(
+                                    modifier = Modifier
+                                        .align(Alignment.BottomCenter)
+                                        .fillMaxWidth()
+                                        .height(16.dp)
+                                        .background(Color(0xFF2A3033))
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxHeight()
+                                            .fillMaxWidth(progress)
+                                            .background(AccentTeal)
+                                    )
+                                    Text(
+                                        text = "${(progress * 100).toInt()}%",
+                                        color = Color.White,
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.align(Alignment.Center)
+                                    )
+                                }
+                            }
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            text = set.name,
+                            color = Color.White,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = "Progress: $collectedCount/$totalSlots",
+                            color = TextMuted,
+                            fontSize = 11.sp
+                        )
+                    }
+                }
+            }
         }
     }
 }
 
+// --- Screen 2: Inside Selected Set ---
+@Composable
+fun SetDetailScreen(
+    set: TcgSet,
+    slots: List<CardSlot>,
+    quantities: Map<String, Int>,
+    onSlotsLoaded: (List<CardSlot>) -> Unit,
+    onIncrement: (String) -> Unit,
+    onDecrement: (String) -> Unit,
+    onOpenScanner: () -> Unit,
+    onBack: () -> Unit
+) {
+    var searchQuery by remember { mutableStateOf("") }
+    var sortAscending by remember { mutableStateOf(true) }
+    var filterMode by remember { mutableStateOf("ALL") } // ALL, OWNED, MISSING
+    var showSortMenu by remember { mutableStateOf(false) }
+    var isLoading by remember { mutableStateOf(false) }
+    var errorText by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(set.id) {
+        if (slots.isEmpty()) {
+            isLoading = true
+            errorText = null
+            try {
+                val loaded = TcgDexRepository.fetchSetSlots(set)
+                onSlotsLoaded(loaded)
+            } catch (e: Exception) {
+                errorText = "Ошибка загрузки: ${e.message ?: "проверьте интернет"}"
+            } finally {
+                isLoading = false
+            }
+        }
+    }
+
+    val displayedSlots = remember(slots, searchQuery, sortAscending, filterMode, quantities) {
+        val filtered = slots.filter { slot ->
+            val qOk = searchQuery.isBlank() ||
+                slot.name.contains(searchQuery, ignoreCase = true) ||
+                slot.localId.contains(searchQuery, ignoreCase = true)
+            val qty = quantities[slot.slotId] ?: 0
+            val fOk = when (filterMode) {
+                "OWNED" -> qty > 0
+                "MISSING" -> qty == 0
+                else -> true
+            }
+            qOk && fOk
+        }
+        if (sortAscending) {
+            filtered.sortedWith(compareBy({ numericCardOrder(it.localId) }, { it.finish }))
+        } else {
+            filtered.sortedWith(compareByDescending<CardSlot> { numericCardOrder(it.localId) }.thenBy { it.finish })
+        }
+    }
+
+    val totalSlots = if (slots.isNotEmpty()) slots.size else set.totalCards
+    val collectedCount = slots.count { (quantities[it.slotId] ?: 0) > 0 }
+
+    Column(Modifier.fillMaxSize().background(BgBlack).padding(horizontal = 12.dp, vertical = 8.dp)) {
+        // Верхняя панель как на скриншоте 2 и 3: Назад + Камера + Поиск + Сортировка/Фильтр
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+            IconButton(onClick = onBack, modifier = Modifier.size(38.dp)) {
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Назад", tint = Color.White)
+            }
+            Box(
+                modifier = Modifier
+                    .size(42.dp)
+                    .clip(CircleShape)
+                    .background(CardSurface)
+                    .border(1.dp, BorderGray, CircleShape)
+                    .clickable { onOpenScanner() },
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(Icons.Default.PhotoCamera, contentDescription = "Сканировать сет", tint = Color.White, modifier = Modifier.size(20.dp))
+            }
+            Spacer(Modifier.width(8.dp))
+            OutlinedTextField(
+                value = searchQuery,
+                onValueChange = { searchQuery = it },
+                placeholder = { Text("Search for products", color = TextMuted, fontSize = 13.sp) },
+                trailingIcon = {
+                    if (searchQuery.isNotEmpty()) {
+                        IconButton(onClick = { searchQuery = "" }, modifier = Modifier.size(28.dp)) {
+                            Icon(Icons.Default.Close, null, tint = Color.White, modifier = Modifier.size(16.dp))
+                        }
+                    }
+                },
+                singleLine = true,
+                shape = RoundedCornerShape(22.dp),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = AccentTeal,
+                    unfocusedBorderColor = BorderGray,
+                    focusedContainerColor = CardSurface,
+                    unfocusedContainerColor = CardSurface
+                ),
+                modifier = Modifier.weight(1f)
+            )
+            Spacer(Modifier.width(6.dp))
+            Box {
+                IconButton(
+                    onClick = { showSortMenu = true },
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clip(CircleShape)
+                        .background(CardSurface)
+                ) {
+                    Icon(Icons.Default.Tune, contentDescription = "Sort & Filter", tint = Color.White, modifier = Modifier.size(20.dp))
+                }
+                DropdownMenu(
+                    expanded = showSortMenu,
+                    onDismissRequest = { showSortMenu = false },
+                    containerColor = Color(0xFF1D2124)
+                ) {
+                    DropdownMenuItem(
+                        text = { Text("123  Card Number: Low to High", color = if (sortAscending) AccentTeal else Color.White) },
+                        onClick = { sortAscending = true; showSortMenu = false }
+                    )
+                    DropdownMenuItem(
+                        text = { Text("321  Card Number: High to Low", color = if (!sortAscending) AccentTeal else Color.White) },
+                        onClick = { sortAscending = false; showSortMenu = false }
+                    )
+                    HorizontalDivider(color = BorderGray)
+                    DropdownMenuItem(
+                        text = { Text("Показать: Все карты", color = if (filterMode == "ALL") AccentTeal else Color.White) },
+                        onClick = { filterMode = "ALL"; showSortMenu = false }
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Показать: Собранные (Qty > 0)", color = if (filterMode == "OWNED") AccentTeal else Color.White) },
+                        onClick = { filterMode = "OWNED"; showSortMenu = false }
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Показать: Недостающие (Qty: 0)", color = if (filterMode == "MISSING") AccentTeal else Color.White) },
+                        onClick = { filterMode = "MISSING"; showSortMenu = false }
+                    )
+                }
+            }
+        }
+
+        Spacer(Modifier.height(10.dp))
+
+        // Шапка сета с логотипом и прогрессом
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(72.dp, 46.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color.White),
+                contentAlignment = Alignment.Center
+            ) {
+                if (set.logoUrl != null) {
+                    AsyncImage(
+                        model = set.logoUrl,
+                        contentDescription = set.name,
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier.fillMaxSize().padding(4.dp)
+                    )
+                } else {
+                    Text(set.id.uppercase(), color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                }
+            }
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(set.name, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text("Progress: $collectedCount/$totalSlots", color = TextMuted, fontSize = 13.sp)
+            }
+        }
+
+        Spacer(Modifier.height(10.dp))
+
+        if (isLoading) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator(color = AccentTeal)
+            }
+        } else if (errorText != null) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text(errorText ?: "", color = Color(0xFFEF5350))
+            }
+        } else {
+            LazyVerticalGrid(
+                columns = GridCells.Fixed(2),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                items(displayedSlots, key = { it.slotId }) { slot ->
+                    val qty = quantities[slot.slotId] ?: 0
+                    CardGridItem(
+                        slot = slot,
+                        qty = qty,
+                        onIncrement = { onIncrement(slot.slotId) },
+                        onDecrement = { onDecrement(slot.slotId) }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun CardGridItem(
+    slot: CardSlot,
+    qty: Int,
+    onIncrement: () -> Unit,
+    onDecrement: () -> Unit
+) {
+    val isOwned = qty > 0
+    val grayscaleFilter = remember {
+        ColorFilter.colorMatrix(ColorMatrix().apply { setToSaturation(0f) })
+    }
+
+    Card(
+        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(containerColor = CardSurface),
+        border = BorderStroke(1.dp, if (isOwned) AccentTeal.copy(alpha = 0.45f) else BorderGray),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(Modifier.padding(10.dp)) {
+            Box(Modifier.fillMaxWidth()) {
+                AsyncImage(
+                    model = slot.imageUrl,
+                    contentDescription = slot.name,
+                    contentScale = ContentScale.FillWidth,
+                    colorFilter = if (isOwned) null else grayscaleFilter,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .alpha(if (isOwned) 1f else 0.55f)
+                )
+                if (isOwned) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.TopStart)
+                            .padding(4.dp)
+                            .size(20.dp)
+                            .clip(CircleShape)
+                            .background(AccentTeal),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(Icons.Default.Check, null, tint = Color.Black, modifier = Modifier.size(14.dp))
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = slot.name,
+                color = if (isOwned) Color.White else Color(0xFFB0B8BE),
+                fontWeight = FontWeight.Bold,
+                fontSize = 14.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = slot.setName,
+                color = TextMuted,
+                fontSize = 11.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = "${slot.rarity} • ${formatCardNumber(slot.localId, slot.setTotal)}",
+                color = TextMuted,
+                fontSize = 11.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = slot.finish,
+                color = if (slot.finish == "Normal") TextMuted else AccentTeal,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Medium
+            )
+
+            Spacer(Modifier.height(8.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    text = "Qty: $qty",
+                    color = if (isOwned) Color.White else TextMuted,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .clickable(enabled = qty > 0) { onDecrement() }
+                        .padding(vertical = 4.dp, horizontal = 2.dp)
+                )
+                Box(
+                    modifier = Modifier
+                        .size(32.dp)
+                        .clip(CircleShape)
+                        .border(1.5.dp, Color.White.copy(alpha = 0.75f), CircleShape)
+                        .clickable { onIncrement() },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(Icons.Default.Add, contentDescription = "Добавить", tint = Color.White, modifier = Modifier.size(18.dp))
+                }
+            }
+        }
+    }
+}
+
+// --- Screen 3: Scoped Scanner ---
 fun extractCardCropBitmap(image: Image, rotationDegrees: Int): Bitmap? {
     return try {
         val yBuffer = image.planes[0].buffer
@@ -374,7 +1063,6 @@ fun extractCardCropBitmap(image: Image, rotationDegrees: Int): Bitmap? {
             }
         } else bmp
 
-        // Увеличенная рамка под карту (пропорция 2.5 : 3.5)
         val w = rotated.width
         val h = rotated.height
         val targetRatio = 2.5f / 3.5f
@@ -395,154 +1083,41 @@ fun extractCardCropBitmap(image: Image, rotationDegrees: Int): Bitmap? {
     }
 }
 
-suspend fun downloadAndHashSet(
-    targetSet: RemoteSetDto,
-    existingDb: List<HashedCard>,
-    onProgress: (String) -> Unit
-): List<HashedCard> = withContext(Dispatchers.IO) {
-    val label = targetSet.ptcgoCode ?: targetSet.id.uppercase()
-    onProgress("Загружаю список карт $label...")
-    val allDtos = mutableListOf<PokemonCardDto>()
-
-    try {
-        var page = 1
-        while (true) {
-            var resp: ApiResponse? = null
-            for (attempt in 1..3) {
-                try {
-                    resp = ApiClient.api.getCardsBySet("set.id:${targetSet.id}", 50, page)
-                    break
-                } catch (e: Exception) {
-                    if (attempt == 3) throw e
-                    delay(800)
-                }
-            }
-            val list = resp?.data ?: emptyList()
-            allDtos.addAll(list)
-            onProgress("$label: получено ${allDtos.size} карт...")
-            if (list.size < 50) break
-            page++
-        }
-    } catch (_: Exception) {
-        onProgress("$label: пробую резервный сервер TCGdex...")
-        val req = Request.Builder().url("https://api.tcgdex.net/v2/en/sets/${targetSet.id}").build()
-        ApiClient.okHttp.newCall(req).execute().use { r ->
-            if (!r.isSuccessful) throw Exception("Сервер недоступен (${r.code})")
-            val body = r.body?.string() ?: throw Exception("Пустой ответ")
-            val json = JsonParser.parseString(body).asJsonObject
-            val cardsArr = json.getAsJsonArray("cards") ?: throw Exception("Карты не найдены")
-            for (el in cardsArr) {
-                val obj = el.asJsonObject
-                val cid = obj.get("id")?.asString ?: continue
-                val cname = obj.get("name")?.asString ?: continue
-                val localId = obj.get("localId")?.asString ?: ""
-                val imgBase = obj.get("image")?.asString ?: continue
-                val imgUrl = "$imgBase/low.webp"
-                allDtos.add(
-                    PokemonCardDto(
-                        id = cid,
-                        name = cname,
-                        number = localId,
-                        set = CardSetDto(targetSet.id, targetSet.name),
-                        images = CardImagesDto(imgUrl, "$imgBase/high.webp")
-                    )
-                )
-            }
-        }
-    }
-
-    val existingIds = existingDb.map { it.id }.toSet()
-    val toDownload = allDtos.filter { !existingIds.contains(it.id) }
-    if (toDownload.isEmpty()) return@withContext existingDb
-
-    val sem = Semaphore(8)
-    var done = 0
-    val newHashed = coroutineScope {
-        toDownload.map { dto ->
-            async {
-                sem.withPermit {
-                    try {
-                        val req = Request.Builder().url(dto.images.small).build()
-                        ApiClient.okHttp.newCall(req).execute().use { r ->
-                            val bytes = r.body?.bytes()
-                            if (bytes != null) {
-                                val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                                if (bmp != null) {
-                                    val (dHash, colorSig) = VisualMatcher.computeSignature(bmp)
-                                    bmp.recycle()
-                                    done++
-                                    if (done % 15 == 0 || done == toDownload.size) {
-                                        onProgress("$label: $done / ${toDownload.size}")
-                                    }
-                                    return@withPermit HashedCard(
-                                        id = dto.id,
-                                        name = dto.name,
-                                        number = dto.number,
-                                        setId = targetSet.id,
-                                        setName = dto.set.name,
-                                        imageUrl = dto.images.small,
-                                        dHash = dHash,
-                                        colorSig = colorSig
-                                    )
-                                }
-                            }
-                        }
-                    } catch (_: Exception) {}
-                    null
-                }
-            }
-        }.awaitAll().filterNotNull()
-    }
-
-    existingDb + newHashed
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ScannerScreen(
-    folders: List<String>,
-    activeFolder: String?,
-    visualDb: List<HashedCard>,
-    allSets: List<RemoteSetDto>,
-    onSetsLoaded: (List<RemoteSetDto>) -> Unit,
-    onUpdateDb: (List<HashedCard>) -> Unit,
-    onSelFolder: (String?) -> Unit,
-    onNewFolder: (String) -> Unit,
-    onAdded: (PokemonCardDto, String) -> Unit
+fun ScannerOverlayScreen(
+    scopeSet: TcgSet?,
+    candidateSlots: List<CardSlot>,
+    quantities: Map<String, Int>,
+    hashes: Map<String, CardHashEntry>,
+    onIncrementSlot: (String) -> Unit,
+    onClose: () -> Unit
 ) {
-    val ctx = LocalContext.current; val owner = LocalLifecycleOwner.current; val scope = rememberCoroutineScope()
+    val ctx = LocalContext.current
+    val owner = LocalLifecycleOwner.current
+    val scope = rememberCoroutineScope()
+
     var perm by remember { mutableStateOf(ContextCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) }
     val launch = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { perm = it }
     LaunchedEffect(Unit) { if (!perm) launch.launch(Manifest.permission.CAMERA) }
 
-    var status by remember {
+    var statusText by remember {
         mutableStateOf(
-            if (visualDb.isEmpty()) "Нажмите [База] справа сверху и скачайте сет"
-            else "Оффлайн-сканер готов (${visualDb.size} карт)"
+            if (scopeSet != null) "Сканирую сет: ${scopeSet.name}"
+            else "Сканирую все открытые сеты (${candidateSlots.distinctBy { it.cardId }.size} карт)"
         )
     }
-    var matchInfo by remember { mutableStateOf("") }
-    var found by remember { mutableStateOf<PokemonCardDto?>(null) }
-    var auto by remember { mutableStateOf(true) }
-    var finishMode by remember { mutableStateOf("Normal") }
-    var selectedSetFilter by remember { mutableStateOf<String?>(null) }
+    var detectedCard by remember { mutableStateOf<CardSlot?>(null) }
     var lastAddedCardId by remember { mutableStateOf("") }
     var lastMatchedHash by remember { mutableLongStateOf(0L) }
-    var candidateId by remember { mutableStateOf("") }
-    var candidateStreak by remember { mutableIntStateOf(0) }
-    var manualTrigger by remember { mutableStateOf(false) }
-    var banner by remember { mutableStateOf<String?>(null) }
-    var dlg by remember { mutableStateOf(false) }
-    var dbDlg by remember { mutableStateOf(false) }
+    var streakId by remember { mutableStateOf("") }
+    var streakCount by remember { mutableIntStateOf(0) }
+    var bannerText by remember { mutableStateOf<String?>(null) }
     var torch by remember { mutableStateOf(false) }
     var extraRot by remember { mutableIntStateOf(0) }
     var camCtrl by remember { mutableStateOf<Camera?>(null) }
 
-    val curFolder by rememberUpdatedState(activeFolder)
-    val curAuto by rememberUpdatedState(auto)
-    val curDb by rememberUpdatedState(visualDb)
-    val curSetFilter by rememberUpdatedState(selectedSetFilter)
-    val curFinishMode by rememberUpdatedState(finishMode)
+    val curSlots by rememberUpdatedState(candidateSlots)
+    val curHashes by rememberUpdatedState(hashes)
     val curExtraRot by rememberUpdatedState(extraRot)
 
     val tone = remember { try { ToneGenerator(AudioManager.STREAM_NOTIFICATION, 95) } catch (_: Exception) { null } }
@@ -550,28 +1125,21 @@ fun ScannerScreen(
 
     fun beepAndVib() {
         try { tone?.startTone(ToneGenerator.TONE_PROP_BEEP, 130) } catch (_: Exception) {}
-        try { if (Build.VERSION.SDK_INT >= 31) (ctx.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator.vibrate(VibrationEffect.createOneShot(60, -1)) else @Suppress("DEPRECATION") (ctx.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator).vibrate(60) } catch (_: Exception) {}
+        try {
+            if (Build.VERSION.SDK_INT >= 31) (ctx.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator.vibrate(VibrationEffect.createOneShot(60, -1))
+            else @Suppress("DEPRECATION") (ctx.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator).vibrate(60)
+        } catch (_: Exception) {}
     }
 
     LaunchedEffect(torch, camCtrl) { try { camCtrl?.cameraControl?.enableTorch(torch) } catch (_: Exception) {} }
-    LaunchedEffect(banner) { if (banner != null) { delay(1300); banner = null } }
-    if (dlg) FolderDlg({ dlg = false }) { onNewFolder(it); onSelFolder(it.trim()); dlg = false }
-    if (dbDlg) {
-        VisualDbDialog(
-            visualDb = visualDb,
-            allSets = allSets,
-            activeSetFilter = selectedSetFilter,
-            onSetsLoaded = onSetsLoaded,
-            onSelectSetFilter = { selectedSetFilter = it },
-            onUpdateDb = { updated ->
-                onUpdateDb(updated)
-                status = "База обновлена (${updated.size} карт)"
-            },
-            onDismiss = { dbDlg = false }
-        )
-    }
+    LaunchedEffect(bannerText) { if (bannerText != null) { delay(1300); bannerText = null } }
 
-    if (!perm) { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Button({ launch.launch(Manifest.permission.CAMERA) }) { Text("Разрешить камеру") } }; return }
+    if (!perm) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Button(onClick = { launch.launch(Manifest.permission.CAMERA) }) { Text("Разрешить камеру") }
+        }
+        return
+    }
 
     Box(Modifier.fillMaxSize()) {
         AndroidView(factory = { c ->
@@ -580,66 +1148,64 @@ fun ScannerScreen(
                     val prov = ProcessCameraProvider.getInstance(c).get()
                     val prev = Preview.Builder().build().apply { setSurfaceProvider(pv.surfaceProvider) }
                     val an = ImageAnalysis.Builder().setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build()
+                    val textRec = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
                     var lastT = 0L
+
                     an.setAnalyzer(Executors.newSingleThreadExecutor()) { px ->
                         val now = System.currentTimeMillis()
-                        if (!manualTrigger && now - lastT < 180) { px.close(); return@setAnalyzer }
+                        if (now - lastT < 220) { px.close(); return@setAnalyzer }
                         @androidx.camera.core.ExperimentalGetImage val img = px.image
                         if (img != null) {
                             lastT = now
                             val rot = (px.imageInfo.rotationDegrees + curExtraRot) % 360
                             val crop = extractCardCropBitmap(img, rot)
                             if (crop != null) {
-                                val (frameHash, frameColor) = VisualMatcher.computeSignature(crop)
-                                crop.recycle()
-
-                                val db = curDb
-                                val isManual = manualTrigger
-                                manualTrigger = false
-
-                                if (db.isEmpty()) {
-                                    if (isManual) status = "Сначала скачайте сет в [База]"
-                                } else {
-                                    val match = VisualMatcher.findBestMatch(frameHash, frameColor, db, curSetFilter)
-                                    if (match == null) {
-                                        candidateId = ""
-                                        candidateStreak = 0
-                                        if (lastAddedCardId.isNotEmpty() && java.lang.Long.bitCount(frameHash xor lastMatchedHash) > 18) {
-                                            lastAddedCardId = ""
-                                            status = "Жду следующую карту..."
-                                        } else if (isManual) {
-                                            status = "Карта не узнана — выровняйте в рамке"
-                                        }
-                                    } else {
-                                        val (card, score) = match
-                                        matchInfo = "${card.name} (${card.setName} #${card.number}) • точность ${100 - (score / 10).coerceIn(1, 95)}%"
-
-                                        if (card.id == candidateId) {
-                                            candidateStreak++
+                                val (frameHash, frameColor) = CardRecognizer.computeSignature(crop)
+                                val inputImg = InputImage.fromBitmap(crop, 0)
+                                textRec.process(inputImg)
+                                    .addOnSuccessListener { visionText ->
+                                        val match = CardRecognizer.matchCard(
+                                            frameHash = frameHash,
+                                            frameColor = frameColor,
+                                            ocrText = visionText.text,
+                                            candidateSlots = curSlots,
+                                            hashes = curHashes
+                                        )
+                                        if (match == null) {
+                                            streakId = ""
+                                            streakCount = 0
+                                            if (lastAddedCardId.isNotEmpty() && java.lang.Long.bitCount(frameHash xor lastMatchedHash) > 18) {
+                                                lastAddedCardId = ""
+                                                statusText = "Жду следующую карту..."
+                                            }
                                         } else {
-                                            candidateId = card.id
-                                            candidateStreak = 1
-                                        }
-
-                                        if (isManual || (curAuto && candidateStreak >= 2 && card.id != lastAddedCardId)) {
-                                            lastAddedCardId = card.id
-                                            lastMatchedHash = frameHash
-                                            val fin = curFinishMode
-                                            val dto = card.toDto()
-                                            scope.launch(Dispatchers.Main) {
-                                                found = dto
-                                                onAdded(dto, fin)
-                                                beepAndVib()
-                                                status = "Готово: ${card.name} [$fin]"
-                                                banner = "+1 ${card.name} [$fin] → ${curFolder ?: card.setName}"
+                                            if (match.cardId == streakId) streakCount++ else { streakId = match.cardId; streakCount = 1 }
+                                            if (streakCount >= 2 && match.cardId != lastAddedCardId) {
+                                                lastAddedCardId = match.cardId
+                                                lastMatchedHash = frameHash
+                                                val defaultSlot = curSlots.firstOrNull { it.cardId == match.cardId && it.finish == "Normal" } ?: match
+                                                scope.launch(Dispatchers.Main) {
+                                                    detectedCard = defaultSlot
+                                                    onIncrementSlot(defaultSlot.slotId)
+                                                    beepAndVib()
+                                                    statusText = "Найдено: ${defaultSlot.name} (${formatCardNumber(defaultSlot.localId, defaultSlot.setTotal)})"
+                                                    bannerText = "+1 ${defaultSlot.name} [${defaultSlot.finish}]"
+                                                }
                                             }
                                         }
                                     }
-                                }
+                                    .addOnCompleteListener {
+                                        crop.recycle()
+                                        px.close()
+                                    }
+                            } else {
+                                px.close()
                             }
+                        } else {
+                            px.close()
                         }
-                        px.close()
                     }
+
                     try {
                         prov.unbindAll()
                         camCtrl = prov.bindToLifecycle(owner, CameraSelector.DEFAULT_BACK_CAMERA, prev, an)
@@ -648,7 +1214,7 @@ fun ScannerScreen(
             }
         }, modifier = Modifier.fillMaxSize())
 
-        // Большая рамка под карту (пропорция 2.5 x 3.5)
+        // Большая рамка под пропорции карты 2.5 x 3.5
         Canvas(modifier = Modifier.fillMaxSize()) {
             val targetRatio = 2.5f / 3.5f
             var boxW = size.width * 0.82f
@@ -661,7 +1227,7 @@ fun ScannerScreen(
             val top = (size.height - boxH) / 2f + size.height * 0.03f
 
             drawRoundRect(
-                color = if (lastAddedCardId.isNotEmpty()) Color(0xFF4CAF50) else Color.White.copy(alpha = 0.88f),
+                color = if (lastAddedCardId.isNotEmpty()) AccentTeal else Color.White.copy(alpha = 0.88f),
                 topLeft = Offset(left, top),
                 size = Size(boxW, boxH),
                 cornerRadius = CornerRadius(28f, 28f),
@@ -669,306 +1235,92 @@ fun ScannerScreen(
             )
         }
 
+        // Верхняя плашка сканера
         Column(Modifier.align(Alignment.TopCenter).fillMaxWidth().padding(12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
             Surface(color = Color.Black.copy(0.84f), shape = RoundedCornerShape(16.dp)) {
-                Column(Modifier.padding(12.dp, 8.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) {
-                            Text(status, color = Color.White, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            if (matchInfo.isNotEmpty()) {
-                                Text(matchInfo, color = Color(0xFF81D4FA), fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            }
-                        }
-                        FilledTonalButton(
-                            onClick = { dbDlg = true },
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
-                            modifier = Modifier.height(30.dp)
-                        ) {
-                            Icon(Icons.Default.Download, null, modifier = Modifier.size(15.dp))
-                            Spacer(Modifier.width(4.dp))
-                            Text("База (${visualDb.size})", fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                        }
-                        IconButton({ torch = !torch }, Modifier.size(32.dp)) {
-                            Icon(if (torch) Icons.Default.FlashOn else Icons.Default.FlashOff, null, tint = if (torch) Color(0xFFFFD54F) else Color.White, modifier = Modifier.size(18.dp))
-                        }
-                        IconButton({ extraRot = (extraRot + 90) % 360; lastAddedCardId = ""; status = "Поворот: $extraRot°" }, Modifier.size(32.dp)) {
-                            Icon(Icons.Default.RotateRight, null, tint = Color.White, modifier = Modifier.size(18.dp))
-                        }
-                        Switch(auto, { auto = it; if (!it) lastAddedCardId = "" })
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(onClick = onClose, modifier = Modifier.size(34.dp)) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Закрыть", tint = Color.White)
                     }
-                    LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        items(listOf("Normal", "Reverse", "Holo")) { m ->
-                            FilterChip(finishMode == m, { finishMode = m }, { Text(m, fontSize = 11.sp) })
-                        }
+                    Column(Modifier.weight(1f).padding(horizontal = 4.dp)) {
+                        Text(
+                            text = scopeSet?.name ?: "Все сеты",
+                            color = AccentTeal,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = statusText,
+                            color = Color.White,
+                            fontSize = 12.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
                     }
-                    LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        item { FilterChip(activeFolder == null, { onSelFolder(null) }, { Text("Родной сет", fontSize = 11.sp) }) }
-                        items(folders) { f -> FilterChip(activeFolder == f, { onSelFolder(f) }, { Text(f, fontSize = 11.sp) }) }
-                        item { AssistChip({ dlg = true }, { Text("+ Папка", fontSize = 11.sp) }) }
+                    IconButton(onClick = { torch = !torch }, modifier = Modifier.size(34.dp)) {
+                        Icon(if (torch) Icons.Default.FlashOn else Icons.Default.FlashOff, null, tint = if (torch) Color(0xFFFFD54F) else Color.White)
+                    }
+                    IconButton(onClick = { extraRot = (extraRot + 90) % 360; lastAddedCardId = "" }, modifier = Modifier.size(34.dp)) {
+                        Icon(Icons.Default.RotateRight, null, tint = Color.White)
                     }
                 }
             }
-            banner?.let { Spacer(Modifier.height(6.dp)); Surface(color = Color(0xFF2E7D32), shape = RoundedCornerShape(20.dp)) { Text(it, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp, modifier = Modifier.padding(16.dp, 6.dp)) } }
+            bannerText?.let {
+                Spacer(Modifier.height(6.dp))
+                Surface(color = AccentTeal, shape = RoundedCornerShape(20.dp)) {
+                    Text(it, color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 13.sp, modifier = Modifier.padding(16.dp, 6.dp))
+                }
+            }
         }
 
-        Column(
-            Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(14.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            found?.let { c ->
-                Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)) {
-                    Row(Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
-                        AsyncImage(c.images.small, c.name, Modifier.size(60.dp, 84.dp).clip(RoundedCornerShape(8.dp)))
-                        Spacer(Modifier.width(10.dp))
-                        Column(Modifier.weight(1f)) {
-                            Text("${c.name} [$finishMode]", fontWeight = FontWeight.Bold, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            Text("${activeFolder ?: c.set.name} • #${c.number}", fontSize = 12.sp, color = Color.Gray, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            Spacer(Modifier.height(6.dp))
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Button({ onAdded(c, finishMode); beepAndVib(); banner = "+1 ${c.name} [$finishMode]" }, Modifier.weight(1f)) { Text("+1", fontSize = 12.sp) }
-                                OutlinedButton({ found = null; lastAddedCardId = ""; candidateStreak = 0; status = "Жду карту..." }) { Text("Сброс", fontSize = 12.sp) }
-                            }
-                        }
-                    }
-                }
-                Spacer(Modifier.height(8.dp))
+        // Нижняя карточка последней распознанной карты с выбором слота вариации (Normal / Reverse Holofoil)
+        detectedCard?.let { card ->
+            val siblingSlots = remember(card.cardId, candidateSlots) {
+                candidateSlots.filter { it.cardId == card.cardId }
             }
-            FilledTonalButton(
-                onClick = {
-                    lastAddedCardId = ""
-                    candidateStreak = 0
-                    manualTrigger = true
-                },
-                shape = CircleShape,
-                colors = ButtonDefaults.filledTonalButtonColors(
-                    containerColor = Color.Black.copy(0.85f),
-                    contentColor = Color.White
-                )
+            Card(
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = CardSurface),
+                border = BorderStroke(1.dp, AccentTeal),
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .padding(14.dp)
             ) {
-                Icon(Icons.Default.PhotoCamera, null, modifier = Modifier.size(20.dp))
-                Spacer(Modifier.width(8.dp))
-                Text("Скан сейчас", fontWeight = FontWeight.Bold, fontSize = 13.sp)
-            }
-        }
-    }
-}
-
-@Composable
-fun VisualDbDialog(
-    visualDb: List<HashedCard>,
-    allSets: List<RemoteSetDto>,
-    activeSetFilter: String?,
-    onSetsLoaded: (List<RemoteSetDto>) -> Unit,
-    onSelectSetFilter: (String?) -> Unit,
-    onUpdateDb: (List<HashedCard>) -> Unit,
-    onDismiss: () -> Unit
-) {
-    val scope = rememberCoroutineScope()
-    var downloadingId by remember { mutableStateOf<String?>(null) }
-    var loadingSetsList by remember { mutableStateOf(false) }
-    var progressText by remember { mutableStateOf("") }
-    var searchSet by remember { mutableStateOf("") }
-
-    LaunchedEffect(Unit) {
-        if (allSets.isEmpty()) {
-            loadingSetsList = true
-            try {
-                val fetched = withContext(Dispatchers.IO) {
-                    val res = mutableListOf<RemoteSetDto>()
-                    var p = 1
-                    while (true) {
-                        val r = ApiClient.api.getAllSets(250, p)
-                        res.addAll(r.data)
-                        if (r.data.size < 250) break
-                        p++
-                    }
-                    res
-                }
-                if (fetched.isNotEmpty()) onSetsLoaded(fetched)
-            } catch (e: Exception) {
-                progressText = "Ошибка загрузки сетов: ${e.message?.take(30) ?: "сеть"}"
-            } finally {
-                loadingSetsList = false
-            }
-        }
-    }
-
-    val filteredSets = remember(allSets, searchSet) {
-        if (searchSet.isBlank()) allSets
-        else allSets.filter {
-            it.name.contains(searchSet, ignoreCase = true) ||
-                (it.ptcgoCode ?: "").contains(searchSet, ignoreCase = true) ||
-                it.id.contains(searchSet, ignoreCase = true) ||
-                (it.series ?: "").contains(searchSet, ignoreCase = true)
-        }
-    }
-
-    AlertDialog(
-        onDismissRequest = { if (downloadingId == null) onDismiss() },
-        title = {
-            Column {
-                Text("Все сеты (${allSets.size}) • В базе: ${visualDb.size}")
-                if (progressText.isNotEmpty()) {
-                    Text(progressText, fontSize = 12.sp, color = Color(0xFF81D4FA))
-                }
-            }
-        },
-        text = {
-            Column(Modifier.heightIn(max = 420.dp)) {
-                OutlinedTextField(
-                    value = searchSet,
-                    onValueChange = { searchSet = it },
-                    placeholder = { Text("Поиск сета (WHT, 151, Base, Scarlet...)", fontSize = 12.sp) },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(6.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    FilterChip(
-                        selected = activeSetFilter == null,
-                        onClick = { onSelectSetFilter(null) },
-                        label = { Text("Искать по всем (${visualDb.size})", fontSize = 11.sp) }
+                Row(Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    AsyncImage(
+                        model = card.imageUrl,
+                        contentDescription = card.name,
+                        modifier = Modifier.size(56.dp, 78.dp).clip(RoundedCornerShape(8.dp))
                     )
-                }
-                Spacer(Modifier.height(6.dp))
-                if (loadingSetsList && allSets.isEmpty()) {
-                    Box(Modifier.fillMaxWidth().height(160.dp), contentAlignment = Alignment.Center) {
-                        CircularProgressIndicator()
-                    }
-                } else {
-                    LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        items(filteredSets, key = { it.id }) { s ->
-                            val countInDb = visualDb.count { it.setId == s.id }
-                            val isCurrentFilter = activeSetFilter == s.id
-                            val codeBadge = s.ptcgoCode ?: s.id.uppercase()
-                            Row(
-                                Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(if (isCurrentFilter) Color(0xFF1E3A5F) else Color.White.copy(0.05f))
-                                    .clickable { if (countInDb > 0) onSelectSetFilter(if (isCurrentFilter) null else s.id) }
-                                    .padding(horizontal = 10.dp, vertical = 6.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Column(Modifier.weight(1f)) {
-                                    Text("${s.name} ($codeBadge)", fontSize = 13.sp, fontWeight = FontWeight.Medium)
-                                    Text(
-                                        if (countInDb > 0) "Скачано: $countInDb карт" + (if (isCurrentFilter) " • Фильтр" else "")
-                                        else "${s.series ?: ""} • ${s.total ?: "?"} карт",
-                                        fontSize = 11.sp,
-                                        color = if (countInDb > 0) Color(0xFF81C784) else Color.Gray
-                                    )
-                                }
-                                if (downloadingId == s.id) {
-                                    CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
-                                } else {
-                                    TextButton(
-                                        onClick = {
-                                            downloadingId = s.id
-                                            progressText = "Подключение к pokemontcg.io..."
-                                            scope.launch {
-                                                try {
-                                                    val updated = downloadAndHashSet(s, visualDb) { progressText = it }
-                                                    onUpdateDb(updated)
-                                                    onSelectSetFilter(s.id)
-                                                    progressText = "Готово: ${s.name}"
-                                                } catch (e: Exception) {
-                                                    progressText = "Ошибка сети: ${e.message?.take(30) ?: "сбой"}"
-                                                } finally {
-                                                    downloadingId = null
-                                                }
-                                            }
-                                        },
-                                        enabled = downloadingId == null
-                                    ) {
-                                        Text(if (countInDb > 0) "Обновить" else "Скачать", fontSize = 12.sp)
+                    Spacer(Modifier.width(10.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(card.name, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text("${card.setName} • ${formatCardNumber(card.localId, card.setTotal)}", color = TextMuted, fontSize = 12.sp)
+                        Spacer(Modifier.height(6.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            siblingSlots.forEach { s ->
+                                val q = quantities[s.slotId] ?: 0
+                                FilterChip(
+                                    selected = q > 0,
+                                    onClick = {
+                                        onIncrementSlot(s.slotId)
+                                        beepAndVib()
+                                        bannerText = "+1 ${s.name} [${s.finish}]"
+                                    },
+                                    label = {
+                                        Text(
+                                            text = "${if (s.finish == "Reverse Holofoil") "Reverse" else s.finish} ($q)",
+                                            fontSize = 11.sp
+                                        )
                                     }
-                                }
+                                )
                             }
-                        }
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = onDismiss, enabled = downloadingId == null) {
-                Text("Закрыть")
-            }
-        }
-    )
-}
-
-@Composable
-fun FolderDlg(onDim: () -> Unit, onOk: (String) -> Unit) {
-    var n by remember { mutableStateOf("") }
-    AlertDialog(onDismissRequest = onDim, title = { Text("Новая папка") }, text = { OutlinedTextField(n, { n = it }, placeholder = { Text("Название...") }, singleLine = true, modifier = Modifier.fillMaxWidth()) },
-        confirmButton = { Button({ onOk(n) }, enabled = n.trim().isNotEmpty()) { Text("Создать") } }, dismissButton = { TextButton(onDim) { Text("Отмена") } })
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun CollectionScreen(cards: List<CollectedCard>, folders: List<String>, onNewF: (String) -> Unit, onDelF: (String) -> Unit, onMove: (String, String) -> Unit, onChgFin: (String) -> Unit, onInc: (String) -> Unit, onDec: (String) -> Unit) {
-    val ctx = LocalContext.current
-    var q by remember { mutableStateOf("") }; var set by remember { mutableStateOf("Все") }
-    var dlg by remember { mutableStateOf(false) }; var mov by remember { mutableStateOf<CollectedCard?>(null) }
-    val sets = remember(cards, folders) { listOf("Все") + (folders + cards.map { it.setName }).distinct().sorted() }
-    LaunchedEffect(sets) { if (!sets.contains(set)) set = "Все" }
-    val list = remember(cards, q, set) { cards.filter { (set == "Все" || it.setName == set) && (q.isBlank() || it.name.contains(q, true) || it.number.contains(q, true) || it.setName.contains(q, true) || (it.finish ?: "").contains(q, true)) } }
-
-    if (dlg) FolderDlg({ dlg = false }) { onNewF(it); set = it.trim(); dlg = false }
-    mov?.let { c ->
-        val all = (folders + cards.map { it.setName }).distinct().sorted()
-        AlertDialog(onDismissRequest = { mov = null }, title = { Text("В папку:") }, text = { Column { all.forEach { f -> TextButton({ onMove(c.id, f); mov = null }) { Text(f) } } } },
-            confirmButton = { TextButton({ mov = null; dlg = true }) { Text("+ Новая") } }, dismissButton = { TextButton({ mov = null }) { Text("Закрыть") } })
-    }
-
-    Column(Modifier.fillMaxSize().padding(16.dp)) {
-        Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
-            Column { Text("Моя коллекция", fontSize = 22.sp, fontWeight = FontWeight.Bold); Text("Карт: ${list.sumOf { it.count }} (${list.size} уник.)", color = Color.Gray, fontSize = 13.sp) }
-            Row {
-                IconButton({ dlg = true }) { Icon(Icons.Default.CreateNewFolder, null) }
-                IconButton({ ctx.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply { putExtra(Intent.EXTRA_TEXT, list.joinToString("\n") { "${it.count}x ${it.name} [${it.finish ?: "Normal"}] (${it.setName} #${it.number})" }); type = "text/plain" }, "Экспорт")) }, enabled = list.isNotEmpty()) { Icon(Icons.Default.Share, null) }
-            }
-        }
-        Spacer(Modifier.height(8.dp)); OutlinedTextField(q, { q = it }, Modifier.fillMaxWidth(), placeholder = { Text("Поиск (имя, сет, Reverse)...") }, singleLine = true); Spacer(Modifier.height(8.dp))
-        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(sets) { s ->
-                val cnt = if (s == "Все") cards.sumOf { it.count } else cards.filter { it.setName == s }.sumOf { it.count }
-                FilterChip(set == s, { set = s }, { Text("$s ($cnt)") }, trailingIcon = if (folders.contains(s) && cnt == 0) { { Icon(Icons.Default.Close, null, Modifier.size(16.dp).clickable { onDelF(s) }) } } else null)
-            }
-            item { AssistChip({ dlg = true }, { Text("+ Папка") }) }
-        }
-        Spacer(Modifier.height(10.dp))
-        if (list.isEmpty()) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Пусто", color = Color.Gray) }
-        else LazyVerticalGrid(GridCells.Fixed(2), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            items(list, key = { it.id }) { c ->
-                val fin = c.finish ?: "Normal"
-                val finColor = when (fin) {
-                    "Holo" -> Color(0xFFFFB300)
-                    "Reverse" -> Color(0xFF26C6DA)
-                    else -> Color(0xFF616161)
-                }
-                Card(shape = RoundedCornerShape(12.dp)) {
-                    Column(Modifier.padding(8.dp)) {
-                        Box {
-                            AsyncImage(c.imageUrl, c.name, contentScale = ContentScale.FillWidth, modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)))
-                            Box(Modifier.align(Alignment.TopEnd).padding(6.dp).background(MaterialTheme.colorScheme.primary, CircleShape).padding(8.dp, 4.dp)) { Text("x${c.count}", color = MaterialTheme.colorScheme.onPrimary, fontWeight = FontWeight.Bold, fontSize = 12.sp) }
-                            Box(
-                                Modifier
-                                    .align(Alignment.BottomStart)
-                                    .padding(6.dp)
-                                    .background(finColor.copy(alpha = 0.92f), RoundedCornerShape(6.dp))
-                                    .clickable { onChgFin(c.id) }
-                                    .padding(6.dp, 2.dp)
-                            ) { Text(fin, color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 10.sp) }
-                        }
-                        Spacer(Modifier.height(6.dp)); Text(c.name, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Text("${c.setName} #${c.number}", fontSize = 11.sp, color = Color.Gray, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.clickable { mov = c })
-                        Spacer(Modifier.height(4.dp))
-                        Row(Modifier.fillMaxWidth(), Arrangement.SpaceEvenly, Alignment.CenterVertically) {
-                            FilledTonalIconButton({ onDec(c.id) }, Modifier.size(32.dp)) { Icon(Icons.Default.Remove, null, Modifier.size(16.dp)) }
-                            Text("${c.count}", fontWeight = FontWeight.Bold)
-                            FilledTonalIconButton({ onInc(c.id) }, Modifier.size(32.dp)) { Icon(Icons.Default.Add, null, Modifier.size(16.dp)) }
                         }
                     }
                 }
